@@ -10,7 +10,7 @@ export interface SpeechResult {
 
 export async function startVoiceRecognition(
   onResult: (result: SpeechResult) => void,
-  options: RecognizeOptions = {}
+  options: RecognizeOptions = {},
 ): Promise<void> {
   console.info('调用科大讯飞语音识别（stub）', options);
   // TODO: 集成 WebRTC / SDK，实现实时语音识别
