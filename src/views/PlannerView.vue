@@ -104,9 +104,15 @@
             <div class="card-header">
               <span>语音 / 文本需求描述</span>
               <el-space>
-                <el-button size="small" type="primary" :loading="isListening" @click="toggleVoice">
+                <el-button
+                  size="small"
+                  :type="isListening ? 'danger' : 'primary'"
+                  :plain="isListening"
+                  @click="toggleVoice"
+                >
                   <template #icon>
-                    <el-icon><Microphone /></el-icon>
+                    <el-icon v-if="isListening"><VideoPause /></el-icon>
+                    <el-icon v-else><Microphone /></el-icon>
                   </template>
                   {{ isListening ? '停止识别' : '语音输入' }}
                 </el-button>
@@ -244,6 +250,7 @@ import { computed, onBeforeUnmount } from 'vue';
 import { storeToRefs } from 'pinia';
 import {
   Microphone,
+  VideoPause,
   Food,
   Suitcase,
   CoffeeCup,
