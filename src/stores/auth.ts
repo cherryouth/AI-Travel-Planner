@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue';
 import { defineStore } from 'pinia';
-import type { Provider, Session, User } from '@supabase/supabase-js';
+import type { Provider, Session, SupabaseClient, User } from '@supabase/supabase-js';
 import { getSupabaseClient } from '../services/supabaseClient';
 
 interface EmailAuthPayload {
@@ -9,8 +9,6 @@ interface EmailAuthPayload {
 }
 
 export const useAuthStore = defineStore('auth', () => {
-  const supabase = getSupabaseClient();
-
   const user = ref<User | null>(null);
   const session = ref<Session | null>(null);
   const initializing = ref(false);
@@ -20,6 +18,22 @@ export const useAuthStore = defineStore('auth', () => {
 
   const isAuthenticated = computed(() => Boolean(user.value));
 
+  function ensureClient(): SupabaseClient | null {
+    try {
+      return getSupabaseClient();
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Supabase 客户端初始化失败，请检查环境变量配置';
+      error.value = message;
+
+      if (import.meta.env.DEV) {
+        console.error('Supabase 客户端创建失败：', err);
+      }
+
+      return null;
+    }
+  }
+
   async function init() {
     if (initializing.value || unsubscribe) {
       return;
@@ -27,7 +41,12 @@ export const useAuthStore = defineStore('auth', () => {
     initializing.value = true;
 
     try {
-      const { data, error: sessionError } = await supabase.auth.getSession();
+      const client = ensureClient();
+      if (!client) {
+        return;
+      }
+
+      const { data, error: sessionError } = await client.auth.getSession();
       if (sessionError) {
         error.value = sessionError.message;
       }
@@ -35,7 +54,7 @@ export const useAuthStore = defineStore('auth', () => {
       session.value = data.session;
       user.value = data.session?.user ?? null;
 
-      const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      const { data: listener } = client.auth.onAuthStateChange((_event, nextSession) => {
         session.value = nextSession;
         user.value = nextSession?.user ?? null;
       });
@@ -58,7 +77,13 @@ export const useAuthStore = defineStore('auth', () => {
     resetError();
     loading.value = true;
 
-    const { data: result, error: authError } = await supabase.auth.signInWithPassword(payload);
+    const client = ensureClient();
+    if (!client) {
+      loading.value = false;
+      throw new Error(error.value ?? 'Supabase 未正确配置');
+    }
+
+    const { data: result, error: authError } = await client.auth.signInWithPassword(payload);
     loading.value = false;
 
     if (authError) {
@@ -74,7 +99,13 @@ export const useAuthStore = defineStore('auth', () => {
     resetError();
     loading.value = true;
 
-    const { data: result, error: authError } = await supabase.auth.signUp(payload);
+    const client = ensureClient();
+    if (!client) {
+      loading.value = false;
+      throw new Error(error.value ?? 'Supabase 未正确配置');
+    }
+
+    const { data: result, error: authError } = await client.auth.signUp(payload);
     loading.value = false;
 
     if (authError) {
@@ -90,7 +121,12 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function signOut() {
     resetError();
-    const { error: signOutError } = await supabase.auth.signOut();
+    const client = ensureClient();
+    if (!client) {
+      throw new Error(error.value ?? 'Supabase 未正确配置');
+    }
+
+    const { error: signOutError } = await client.auth.signOut();
     if (signOutError) {
       error.value = signOutError.message;
       throw signOutError;
@@ -101,7 +137,12 @@ export const useAuthStore = defineStore('auth', () => {
 
   async function signInWithProvider(provider: Provider) {
     resetError();
-    const { error: authError } = await supabase.auth.signInWithOAuth({ provider });
+    const client = ensureClient();
+    if (!client) {
+      throw new Error(error.value ?? 'Supabase 未正确配置');
+    }
+
+    const { error: authError } = await client.auth.signInWithOAuth({ provider });
     if (authError) {
       error.value = authError.message;
       throw authError;
