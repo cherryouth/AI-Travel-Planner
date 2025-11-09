@@ -4,13 +4,7 @@ type AMapStatic = typeof globalThis extends { AMap: infer T } ? T : unknown;
 
 let loaderPromise: Promise<AMapStatic> | null = null;
 
-const DEFAULT_PLUGINS = [
-  'AMap.Scale',
-  'AMap.ToolBar',
-  'AMap.Geolocation',
-  'AMap.Driving',
-  'AMap.Walking',
-];
+const DEFAULT_PLUGINS = ['AMap.Scale', 'AMap.ToolBar'];
 
 export async function loadAmap(): Promise<AMapStatic> {
   if (loaderPromise) {

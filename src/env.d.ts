@@ -18,6 +18,7 @@ interface ImportMetaEnv {
   readonly VITE_IFLYTEK_API_KEY: string;
   readonly VITE_IFLYTEK_API_SECRET: string;
   readonly VITE_AMAP_WEB_KEY: string;
+  readonly VITE_AMAP_WEB_SERVICE_KEY?: string;
 }
 
 interface ImportMeta {

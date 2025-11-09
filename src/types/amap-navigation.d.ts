@@ -60,11 +60,20 @@ declare namespace AMap {
     bottom?: string;
   }
 
-  class ToolBar {
+  abstract class Control {
+    constructor(options?: Record<string, unknown>);
+    addTo(map: Map, position?: ControlPositionOptions): void;
+    removeFrom(map: Map): void;
+    remove(): void;
+    show(): void;
+    hide(): void;
+  }
+
+  class ToolBar extends Control {
     constructor(options?: { position?: ControlPositionOptions });
   }
 
-  class Scale {
+  class Scale extends Control {
     constructor(options?: Record<string, unknown>);
   }
 }

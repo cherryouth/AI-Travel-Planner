@@ -72,16 +72,10 @@
 
       <div class="map-layout">
         <div class="map-container">
+          <div ref="mapContainer" class="map-canvas" role="application" aria-label="高德地图" />
           <div v-if="isLoadingMap" class="map-loading">
             <el-skeleton animated :rows="6" />
           </div>
-          <div
-            v-else
-            ref="mapContainer"
-            class="map-canvas"
-            role="application"
-            aria-label="高德地图"
-          />
           <el-empty v-if="!isLoadingMap && !mapReady" description="地图加载失败，请稍后重试" />
         </div>
 
@@ -122,8 +116,18 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { ElMessage } from 'element-plus';
 import { loadAmap } from '../services/amapLoader';
-
-type NavMode = 'driving' | 'walking';
+import {
+  convertGpsToGcj,
+  detectCoordinateText,
+  fetchRoute,
+  geocodeAddress,
+  locateByIP,
+  reverseGeocode,
+  type Coordinates,
+  type NavMode,
+  type RouteResult,
+  type RouteStepResult,
+} from '../services/amapWebService';
 
 interface RouteSummary {
   distance: number;
@@ -132,23 +136,11 @@ interface RouteSummary {
   mode: NavMode;
 }
 
-interface RouteStep {
+interface RouteStepDisplay {
   instruction: string;
   distance?: number;
   duration?: number;
 }
-
-interface GeolocationResult {
-  position: { lng: number; lat: number };
-  formattedAddress?: string;
-  addressComponent?: {
-    city?: string;
-    province?: string;
-    district?: string;
-  };
-}
-
-type PlainRecord = Record<string, unknown>;
 
 const mapContainer = ref<HTMLDivElement | null>(null);
 const mapInstance = ref<AMap.Map | null>(null);
@@ -168,9 +160,19 @@ const form = reactive({
 });
 
 const routeSummary = ref<RouteSummary | null>(null);
-const routeSteps = ref<RouteStep[]>([]);
+const routeSteps = ref<RouteStepDisplay[]>([]);
+const routePolyline = ref<AMap.Polyline | null>(null);
 
-const services = reactive<{ driving?: AMap.Driving; walking?: AMap.Walking }>({});
+const locationCache = reactive({
+  origin: {
+    text: '',
+    coords: null as Coordinates | null,
+  },
+  destination: {
+    text: '',
+    coords: null as Coordinates | null,
+  },
+});
 
 const mapReady = computed(() => Boolean(mapInstance.value) && !mapError.value);
 
@@ -209,12 +211,12 @@ async function initMap() {
       center: [116.397428, 39.90923],
       pitch: 35,
     });
-    mapInstance.value.addControl(new AMap.Scale());
-    mapInstance.value.addControl(
-      new AMap.ToolBar({
-        position: { right: '20px', top: '40px' },
-      }),
-    );
+    const scaleControl = new AMap.Scale();
+    mapInstance.value.addControl(scaleControl);
+    const toolBarControl = new AMap.ToolBar({
+      position: { right: '20px', top: '40px' },
+    });
+    mapInstance.value.addControl(toolBarControl);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     mapError.value = message;
@@ -224,42 +226,12 @@ async function initMap() {
   }
 }
 
-async function getNavigationService(mode: NavMode) {
-  const AMap = await loadAmap();
-  const map = mapInstance.value;
-  if (!map) {
-    throw new Error('地图尚未加载完成');
-  }
-
-  if (mode === 'driving') {
-    if (!services.driving) {
-      services.driving = new AMap.Driving({
-        map,
-        showTraffic: true,
-        autoFitView: true,
-        extensions: 'all',
-      });
-    }
-    return services.driving;
-  }
-
-  if (!services.walking) {
-    services.walking = new AMap.Walking({
-      map,
-      autoFitView: true,
-    });
-  }
-  return services.walking;
-}
-
 function clearRoutes() {
   routeSummary.value = null;
   routeSteps.value = [];
-  if (services.driving) {
-    services.driving.clear();
-  }
-  if (services.walking) {
-    services.walking.clear();
+  if (routePolyline.value) {
+    routePolyline.value.setMap(null);
+    routePolyline.value = null;
   }
 }
 
@@ -269,6 +241,10 @@ function handleFieldFocus(field: 'origin' | 'destination') {
 
 function swapLocations() {
   [form.origin, form.destination] = [form.destination, form.origin];
+  [locationCache.origin, locationCache.destination] = [
+    { ...locationCache.destination },
+    { ...locationCache.origin },
+  ];
 }
 
 async function handleSearchRoute() {
@@ -283,32 +259,18 @@ async function handleSearchRoute() {
 
   loadingRoute.value = true;
   try {
-    const service = await getNavigationService(navMode.value);
-    service.clear();
-    await new Promise<void>((resolve, reject) => {
-      service.search(
-        { keyword: form.origin.trim() },
-        { keyword: form.destination.trim() },
-        (status: string, result: unknown) => {
-          if (status === 'complete') {
-            try {
-              updateRouteInfo(navMode.value, result);
-              mapInstance.value?.setFitView(undefined, true, [120, 160, 120, 180]);
-              resolve();
-            } catch (parseError) {
-              const message = parseError instanceof Error ? parseError.message : '路线解析失败';
-              reject(new Error(message));
-            }
-          } else {
-            const message = extractResultMessage(result) ?? '路线规划失败，请确认输入是否正确';
-            reject(new Error(message));
-          }
-        },
-      );
-    });
+    const [originCoords, destinationCoords] = await Promise.all([
+      resolveCoordinates('origin'),
+      resolveCoordinates('destination'),
+    ]);
+
+    const route = await fetchRoute(navMode.value, originCoords, destinationCoords);
+    updateRouteDisplay(navMode.value, route);
+    await renderRoutePolyline(route.steps);
   } catch (error) {
     clearRoutes();
-    ElMessage.error(error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    ElMessage.error(message);
   } finally {
     loadingRoute.value = false;
   }
@@ -325,63 +287,59 @@ async function locateCurrentPosition() {
 
   locating.value = true;
   try {
-    const AMap = await loadAmap();
-    const geolocation = new AMap.Geolocation({
-      enableHighAccuracy: true,
-      timeout: 10000,
-      convert: true,
-      showButton: false,
-      showCircle: false,
-    });
+    let targetCoords: Coordinates | null = null;
 
-    const result = await new Promise<GeolocationResult>((resolve, reject) => {
-      geolocation.getCurrentPosition((status: string, data: unknown) => {
-        if (status === 'complete' && isPlainObject(data)) {
-          const position = extractLngLat(data.position);
-          if (position) {
-            resolve({
-              position,
-              formattedAddress:
-                typeof data.formattedAddress === 'string' ? data.formattedAddress : undefined,
-              addressComponent: isPlainObject(data.addressComponent)
-                ? (data.addressComponent as GeolocationResult['addressComponent'])
-                : undefined,
-            });
-            return;
-          }
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      try {
+        const position = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            enableHighAccuracy: true,
+            timeout: 10000,
+            maximumAge: 0,
+          });
+        });
+        const gpsCoords: Coordinates = [position.coords.longitude, position.coords.latitude];
+        try {
+          targetCoords = await convertGpsToGcj(gpsCoords);
+        } catch (convertError) {
+          // eslint-disable-next-line no-console
+          console.warn('[AMap] 坐标转换失败，使用原始定位坐标：', convertError);
+          targetCoords = gpsCoords;
         }
-        const message = extractResultMessage(data) ?? '定位失败，请稍后重试';
-        reject(new Error(message));
-      });
-    });
+      } catch (geoError) {
+        // eslint-disable-next-line no-console
+        console.warn('[AMap] 浏览器定位失败，尝试使用 IP 粗略定位：', geoError);
+      }
+    }
 
-    const { lng, lat } = result.position;
+    if (!targetCoords) {
+      const ipLocation = await locateByIP().catch(() => null);
+      if (ipLocation?.location) {
+        targetCoords = ipLocation.location;
+      }
+    }
+
+    if (!targetCoords) {
+      throw new Error('无法获取当前位置，请检查定位权限或网络状态。');
+    }
+
     const map = mapInstance.value;
     if (!map) {
       throw new Error('地图尚未就绪');
     }
 
-    geolocation.destroy();
-
-    const address = result.formattedAddress ?? `${lng.toFixed(6)},${lat.toFixed(6)}`;
+    const regeo = await reverseGeocode(targetCoords).catch(() => null);
+    const address =
+      regeo?.formattedAddress ?? `${targetCoords[0].toFixed(6)},${targetCoords[1].toFixed(6)}`;
     if (activeField.value === 'origin') {
       form.origin = address;
+      locationCache.origin = { text: address, coords: targetCoords };
     } else {
       form.destination = address;
+      locationCache.destination = { text: address, coords: targetCoords };
     }
 
-    if (!locationMarker.value) {
-      locationMarker.value = new AMap.Marker({
-        position: [lng, lat],
-        map,
-        title: '当前位置',
-      });
-    } else {
-      locationMarker.value.setMap(map);
-      locationMarker.value.setPosition([lng, lat]);
-    }
-
-    map.setZoomAndCenter(14, [lng, lat]);
+    await updateLocationMarker(targetCoords);
     ElMessage.success('已获取当前位置');
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : String(error));
@@ -390,111 +348,101 @@ async function locateCurrentPosition() {
   }
 }
 
-function updateRouteInfo(mode: NavMode, result: unknown) {
-  if (!isPlainObject(result)) {
-    throw new Error('路线返回格式异常');
+async function resolveCoordinates(field: 'origin' | 'destination'): Promise<Coordinates> {
+  const input = form[field].trim();
+  if (!input) {
+    throw new Error(field === 'origin' ? '请填写起点信息' : '请填写终点信息');
   }
 
-  const routesSource = Array.isArray(result.routes) ? result.routes : [];
-  if (routesSource.length === 0) {
-    throw new Error('未获取到有效路线');
+  const direct = detectCoordinateText(input);
+  if (direct) {
+    locationCache[field] = { text: input, coords: direct };
+    return direct;
   }
 
-  const route = routesSource[0];
-  if (!isPlainObject(route)) {
-    throw new Error('路线数据格式异常');
+  const cached = locationCache[field];
+  if (cached.coords && cached.text === input) {
+    return cached.coords;
   }
 
-  const distance = getNumber(route.distance, 0);
-  const duration = getNumber(route.time ?? route.duration, 0);
-  const taxiCostValue = getNumber(route.taxi_cost ?? route.taxiCost, 0);
+  const geocode = await geocodeAddress(input);
+  if (!geocode?.location) {
+    throw new Error('未能解析该地址，请尝试输入更精确的位置');
+  }
 
+  locationCache[field] = { text: input, coords: geocode.location };
+  return geocode.location;
+}
+
+function updateRouteDisplay(mode: NavMode, route: RouteResult) {
   routeSummary.value = {
     mode,
-    distance,
-    duration,
-    taxiCost: mode === 'driving' && taxiCostValue > 0 ? taxiCostValue : undefined,
+    distance: route.distance,
+    duration: route.duration,
+    taxiCost: mode === 'driving' && route.taxiCost ? route.taxiCost : undefined,
   };
 
-  const stepsSource = Array.isArray(route.steps) ? route.steps : [];
-  const normalizedSteps: RouteStep[] = [];
-  stepsSource.forEach((step, index) => {
-    if (!isPlainObject(step)) {
-      return;
-    }
-    const instruction =
-      typeof step.instruction === 'string' ? step.instruction : `第 ${index + 1} 段`;
-    const stepDistance = getNumber(step.distance, 0);
-    const stepDuration = getNumber(step.time ?? step.duration, 0);
-    normalizedSteps.push({
-      instruction: stripHtml(instruction),
-      distance: stepDistance > 0 ? stepDistance : undefined,
-      duration: stepDuration > 0 ? stepDuration : undefined,
+  routeSteps.value = route.steps.map((step, index) => ({
+    instruction: step.instruction || `第 ${index + 1} 段`,
+    distance: step.distance,
+    duration: step.duration,
+  }));
+}
+
+async function renderRoutePolyline(steps: RouteStepResult[]): Promise<void> {
+  const map = mapInstance.value;
+  if (!map) {
+    throw new Error('地图尚未加载完成');
+  }
+
+  if (routePolyline.value) {
+    routePolyline.value.setMap(null);
+    routePolyline.value = null;
+  }
+
+  const path: [number, number][] = [];
+  steps.forEach(step => {
+    step.polyline.forEach(([lng, lat]) => {
+      path.push([lng, lat]);
     });
   });
-  routeSteps.value = normalizedSteps;
+
+  if (!path.length) {
+    return;
+  }
+
+  const AMap = await loadAmap();
+  routePolyline.value = new AMap.Polyline({
+    path,
+    showDir: true,
+    strokeColor: navMode.value === 'driving' ? '#409EFF' : '#67C23A',
+    strokeWeight: 6,
+    lineJoin: 'round',
+    lineCap: 'round',
+  });
+  routePolyline.value.setMap(map);
+  map.setFitView([routePolyline.value], true, [120, 160, 120, 180]);
 }
 
-function extractResultMessage(result: unknown): string | null {
-  if (typeof result === 'string') {
-    return result;
-  }
-  if (!isPlainObject(result)) {
-    return null;
-  }
-  if (typeof result.info === 'string' && result.info) {
-    return result.info;
-  }
-  if (typeof result.message === 'string' && result.message) {
-    return result.message;
-  }
-  return null;
-}
-
-function isPlainObject(value: unknown): value is PlainRecord {
-  return Object.prototype.toString.call(value) === '[object Object]';
-}
-
-function extractLngLat(value: unknown): { lng: number; lat: number } | null {
-  if (!value || typeof value !== 'object') {
-    return null;
-  }
-  const record = value as PlainRecord & {
-    lng?: number;
-    lat?: number;
-    getLng?: () => number;
-    getLat?: () => number;
-  };
-
-  if (typeof record.lng === 'number' && typeof record.lat === 'number') {
-    return { lng: record.lng, lat: record.lat };
+async function updateLocationMarker(coords: Coordinates): Promise<void> {
+  const map = mapInstance.value;
+  if (!map) {
+    throw new Error('地图尚未加载完成');
   }
 
-  const lng = typeof record.getLng === 'function' ? record.getLng() : undefined;
-  const lat = typeof record.getLat === 'function' ? record.getLat() : undefined;
-  if (typeof lng === 'number' && typeof lat === 'number') {
-    return { lng, lat };
+  const AMap = await loadAmap();
+  if (!locationMarker.value) {
+    locationMarker.value = new AMap.Marker({
+      map,
+      position: coords,
+      title: '当前位置',
+    });
+  } else {
+    locationMarker.value.setMap(map);
+    locationMarker.value.setPosition(coords);
   }
 
-  return null;
-}
-
-function getNumber(value: unknown, fallback = 0): number {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
-}
-
-function stripHtml(value: string): string {
-  return value
-    .replace(/<[^>]*>/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  map.setZoomAndCenter(14, coords);
 }
 
 function formatDistance(distance: number): string {
