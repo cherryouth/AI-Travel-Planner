@@ -1,4 +1,4 @@
-import type { DayItem, DayItemType, DayPlan, TravelPreferences, TripPlan } from '../types/plan';
+﻿import type { DayItem, DayItemType, DayPlan, TravelPreferences, TripPlan } from '../types/plan';
 
 interface GeneratePlanPayload {
   destination: string;
@@ -682,8 +682,93 @@ function resolveHunyuanConfig(): HunyuanClientConfig {
   };
 }
 
-const PLAN_RESPONSE_TEMPLATE =
-  '{"plan":{"title":"示例行程标题","destination":"目的地","startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD","travelers":2,"budget":8000,"currency":"CNY","days":[{"date":"YYYY-MM-DD","summary":"当天概述","items":[{"type":"transport","title":"描述","startTime":"08:00","endTime":"09:00","notes":"备注","estimatedCost":300}],"totalEstimatedCost":1200}]},"diagnostics":["关键说明或建议"]}';
+const PLAN_RESPONSE_TEMPLATE = `{
+  "plan": {
+    "title": "示例行程标题",
+    "destination": "目的地",
+    "startDate": "YYYY-MM-DD",
+    "endDate": "YYYY-MM-DD",
+    "travelers": 2,
+    "budget": 8000,
+    "currency": "CNY",
+    "days": [
+      {
+        "date": "YYYY-MM-DD",
+        "summary": "当天概述",
+        "items": [
+          {
+            "type": "transport",
+            "title": "机场快线前往市区",
+            "startTime": "09:00",
+            "endTime": "10:00",
+            "notes": "抵达后购买交通卡",
+            "estimatedCost": 120
+          },
+          {
+            "type": "attraction",
+            "title": "市区地标参观",
+            "startTime": "10:30",
+            "endTime": "13:00",
+            "notes": "提前预约导览",
+            "estimatedCost": 280
+          },
+          {
+            "type": "meal",
+            "title": "本地特色午餐",
+            "startTime": "13:15",
+            "endTime": "14:15",
+            "notes": "尝试招牌菜",
+            "estimatedCost": 180
+          },
+          {
+            "type": "free",
+            "title": "下午自由活动",
+            "notes": "可逛购物区或咖啡馆"
+          },
+          {
+            "type": "hotel",
+            "title": "入住市中心酒店",
+            "startTime": "21:00",
+            "notes": "办理入住手续",
+            "estimatedCost": 520
+          }
+        ],
+        "totalEstimatedCost": 1100
+      },
+      {
+        "date": "YYYY-MM-DD",
+        "summary": "主题活动日",
+        "items": [
+          {
+            "type": "transport",
+            "title": "地铁前往景区",
+            "startTime": "08:30",
+            "estimatedCost": 20
+          },
+          {
+            "type": "attraction",
+            "title": "主题公园游玩",
+            "startTime": "09:30",
+            "endTime": "17:00",
+            "notes": "包含亲子设施",
+            "estimatedCost": 480
+          },
+          {
+            "type": "meal",
+            "title": "公园内特色晚餐",
+            "startTime": "18:00",
+            "estimatedCost": 220
+          }
+        ],
+        "totalEstimatedCost": 720
+      }
+    ]
+  },
+  "diagnostics": [
+    "建议提前在线购买景区门票以避免排队",
+    "预算余量可分配至特色体验或升级餐饮"
+  ]
+}`;
 
 function createHunyuanSystemPrompt(): string {
   return [
