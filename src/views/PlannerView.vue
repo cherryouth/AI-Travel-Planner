@@ -8,7 +8,16 @@
               智能解析
             </el-button>
           </el-tooltip>
-          <el-button type="primary" :loading="loading" @click="handleSubmit"> 生成行程 </el-button>
+          <el-button type="primary" :loading="loading" @click="handleSubmit">生成行程</el-button>
+          <el-button
+            type="success"
+            :disabled="!plan"
+            :loading="planLibraryStore.state.saving"
+            @click="openSaveDialog"
+          >
+            保存到云端
+          </el-button>
+          <el-button type="info" @click="handleOpenPlanLibrary">我的计划</el-button>
           <el-button :disabled="!plan" @click="handleResetPlan">清除结果</el-button>
           <el-button link @click="handleResetForm">重置表单</el-button>
         </el-space>
@@ -116,6 +125,14 @@
                   </template>
                   {{ isListening ? '停止识别' : '语音输入' }}
                 </el-button>
+                <el-button
+                  size="small"
+                  type="success"
+                  :disabled="!voiceLiveText"
+                  @click="handleCompleteRecognition"
+                >
+                  识别完成
+                </el-button>
                 <el-tag v-if="voiceLiveText" type="info" size="small">实时识别中</el-tag>
               </el-space>
             </div>
@@ -139,13 +156,6 @@
             placeholder="语音或手动输入：例如“我想去日本东京，5 天，预算一万元，喜欢美食和动漫，带孩子”"
           />
 
-          <section v-if="parseLogs.length" class="planner__logs">
-            <h4>智能解析记录</h4>
-            <ul>
-              <li v-for="(log, index) in parseLogs" :key="`${log}-${index}`">{{ log }}</li>
-            </ul>
-          </section>
-
           <section v-if="voiceLiveText" class="planner__voice-preview">
             <h4>实时识别</h4>
             <p>{{ voiceLiveText }}</p>
@@ -167,11 +177,15 @@
             </div>
           </template>
 
-          <el-empty v-if="!plan && !loading" description="尚未生成行程，先填写需求吧" />
+          <div v-if="loading" class="plan-streaming">
+            <p class="plan-streaming__status">混元 T1 正在生成行程，请稍候...</p>
+            <el-scrollbar v-if="streamingPreview" height="320px">
+              <pre class="plan-streaming__preview">{{ streamingPreview }}</pre>
+            </el-scrollbar>
+            <el-skeleton v-else :rows="6" animated />
+          </div>
 
-          <el-skeleton v-else-if="loading" :rows="6" animated />
-
-          <div v-else class="plan-result">
+          <div v-else-if="plan" class="plan-result">
             <header class="plan-result__header">
               <div>
                 <h2>{{ plan?.title }}</h2>
@@ -230,6 +244,26 @@
               </el-collapse-item>
             </el-collapse>
           </div>
+
+          <div v-else-if="rawHunyuanContent" class="plan-raw">
+            <p class="plan-raw__title">混元 AI 原始回复：</p>
+            <el-alert
+              v-if="diagnostics.length"
+              type="info"
+              :closable="false"
+              class="planner__alert"
+              title="解析提示"
+            >
+              <ul>
+                <li v-for="(item, index) in diagnostics" :key="`${item}-${index}`">{{ item }}</li>
+              </ul>
+            </el-alert>
+            <el-scrollbar height="360px">
+              <pre class="plan-raw__content">{{ rawHunyuanContent }}</pre>
+            </el-scrollbar>
+          </div>
+
+          <el-empty v-else description="尚未生成行程，先填写需求吧" />
         </el-card>
       </el-col>
     </el-row>
@@ -242,12 +276,108 @@
       show-icon
       :title="error"
     />
+
+    <el-dialog v-model="saveDialogVisible" title="保存行程到云端" width="480px">
+      <template v-if="plan">
+        <el-form label-width="100px">
+          <el-form-item label="计划名称">
+            <el-input v-model="saveForm.title" maxlength="60" />
+          </el-form-item>
+          <el-form-item>
+            <el-checkbox v-model="saveForm.includePreferences"> 同步当前偏好设置 </el-checkbox>
+          </el-form-item>
+          <el-alert
+            v-if="!isAuthenticated"
+            type="warning"
+            :closable="false"
+            show-icon
+            title="登录后方可将计划同步至云端"
+          />
+        </el-form>
+      </template>
+      <template #footer>
+        <el-button @click="saveDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="planLibraryStore.state.saving"
+          :disabled="!plan || !isAuthenticated"
+          @click="handleSavePlanConfirm"
+        >
+          保存
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="planLibraryVisible" title="我的行程计划" width="780px">
+      <template #header-extra>
+        <el-space>
+          <el-button link :loading="planLibraryStore.state.loading" @click="handleRefreshPlans">
+            刷新
+          </el-button>
+        </el-space>
+      </template>
+
+      <el-alert
+        v-if="planLibraryStore.state.error"
+        type="error"
+        :closable="false"
+        class="planner__alert"
+        show-icon
+        :title="planLibraryStore.state.error"
+      />
+
+      <el-empty
+        v-if="!planLibraryStore.state.loading && planLibraryStore.state.plans.length === 0"
+        description="暂无已保存的行程，先生成一个吧"
+      />
+
+      <el-table
+        v-else
+        v-loading="planLibraryStore.state.loading"
+        class="plan-library__table"
+        :data="planLibraryStore.state.plans"
+        height="360"
+        border
+        size="small"
+      >
+        <el-table-column prop="title" label="计划名称" min-width="160" />
+        <el-table-column prop="destination" label="目的地" width="120" />
+        <el-table-column label="日期" min-width="200">
+          <template #default="scope">
+            {{ scope.row.startDate }} 至 {{ scope.row.endDate }}
+          </template>
+        </el-table-column>
+        <el-table-column label="更新于" min-width="160">
+          <template #default="scope">
+            {{ formatDateTime(scope.row.updatedAt) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="200">
+          <template #default="scope">
+            <el-space>
+              <el-button size="small" type="primary" @click="handleSelectPlan(scope.row.id)">
+                载入
+              </el-button>
+              <el-button
+                size="small"
+                type="danger"
+                plain
+                @click="handleDeletePlan(scope.row.id, scope.row.title)"
+              >
+                删除
+              </el-button>
+            </el-space>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-dialog>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
+import { ElMessage, ElMessageBox } from 'element-plus';
 import {
   Microphone,
   VideoPause,
@@ -260,21 +390,28 @@ import {
 import dayjs from 'dayjs';
 import { usePlannerStore } from '../stores/planner';
 import type { DayItemType } from '../types/plan';
+import { usePlanLibraryStore } from '../stores/planLibrary';
+import { useAuthStore } from '../stores/auth';
 
 const plannerStore = usePlannerStore();
+const planLibraryStore = usePlanLibraryStore();
+const authStore = useAuthStore();
+
 const {
   form,
   plan,
   loading,
   error,
   diagnostics,
+  streamingPreview,
+  rawHunyuanContent,
   tripDays,
   voiceLiveText,
   voiceFinalText,
   voiceError,
   isListening,
-  parseLogs,
 } = storeToRefs(plannerStore);
+const { user, isAuthenticated } = storeToRefs(authStore);
 
 const dateRange = computed({
   get: () => {
@@ -292,6 +429,13 @@ const dateRange = computed({
       form.value.endDate = value[1];
     }
   },
+});
+
+const saveDialogVisible = ref(false);
+const planLibraryVisible = ref(false);
+const saveForm = reactive({
+  title: '',
+  includePreferences: true,
 });
 
 function disabledPast(date: Date) {
@@ -362,8 +506,143 @@ function handleAnalyzeIntent() {
   plannerStore.analyzeIntent();
 }
 
+async function handleCompleteRecognition() {
+  await plannerStore.completeVoiceInput();
+}
+
 onBeforeUnmount(() => {
   void plannerStore.teardown();
+});
+
+async function loadPlansWithFeedback() {
+  try {
+    await planLibraryStore.loadPlans();
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+watch(
+  () => plan.value?.title,
+  title => {
+    if (saveDialogVisible.value && title) {
+      saveForm.title = title;
+    }
+  },
+);
+
+watch(saveDialogVisible, visible => {
+  if (visible && plan.value) {
+    saveForm.title = plan.value.title;
+    saveForm.includePreferences = true;
+  }
+});
+
+watch(planLibraryVisible, visible => {
+  if (visible) {
+    void loadPlansWithFeedback();
+  }
+});
+
+watch(
+  user,
+  value => {
+    if (value) {
+      void loadPlansWithFeedback();
+      void planLibraryStore.loadPreferenceProfile();
+    }
+  },
+  { immediate: true },
+);
+
+function openSaveDialog() {
+  if (!plan.value) {
+    ElMessage.warning('请先生成行程，再尝试保存。');
+    return;
+  }
+  if (!isAuthenticated.value) {
+    ElMessage.warning('登录后方可保存行程到云端。');
+  }
+  saveDialogVisible.value = true;
+}
+
+async function handleSavePlanConfirm() {
+  if (!plan.value) {
+    ElMessage.error('当前没有可保存的行程。');
+    return;
+  }
+  if (!isAuthenticated.value) {
+    ElMessage.warning('登录后方可保存行程到云端。');
+    return;
+  }
+
+  const trimmedTitle = saveForm.title.trim();
+  if (!trimmedTitle) {
+    ElMessage.warning('请为行程输入名称。');
+    return;
+  }
+
+  try {
+    const clonedPlan = JSON.parse(JSON.stringify(plan.value));
+    clonedPlan.title = trimmedTitle;
+    plan.value.title = trimmedTitle;
+    await planLibraryStore.savePlan({
+      planResult: {
+        plan: clonedPlan,
+        diagnostics: diagnostics.value,
+      },
+      preferences: saveForm.includePreferences ? plannerStore.getPreferenceSnapshot() : undefined,
+    });
+    ElMessage.success('行程已保存到云端');
+    saveDialogVisible.value = false;
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function handleOpenPlanLibrary() {
+  if (!isAuthenticated.value) {
+    ElMessage.warning('登录后即可管理云端行程。');
+    return;
+  }
+  planLibraryVisible.value = true;
+}
+
+function formatDateTime(input: string) {
+  return dayjs(input).format('YYYY-MM-DD HH:mm');
+}
+
+function handleSelectPlan(planId: string) {
+  planLibraryStore.selectPlan(planId);
+  planLibraryVisible.value = false;
+  ElMessage.success('已载入云端行程');
+}
+
+async function handleDeletePlan(planId: string, title: string) {
+  try {
+    await ElMessageBox.confirm(`确定要删除行程「${title}」吗？删除后不可恢复。`, '删除行程', {
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+    });
+    await planLibraryStore.removePlan(planId);
+    ElMessage.success('行程已删除');
+  } catch (err) {
+    if (err !== 'cancel' && err !== 'close') {
+      ElMessage.error(err instanceof Error ? err.message : String(err));
+    }
+  }
+}
+
+function handleRefreshPlans() {
+  void loadPlansWithFeedback();
+}
+
+onMounted(() => {
+  if (isAuthenticated.value) {
+    void loadPlansWithFeedback();
+    void planLibraryStore.loadPreferenceProfile();
+  }
 });
 </script>
 
@@ -396,26 +675,59 @@ onBeforeUnmount(() => {
   gap: 1rem;
 }
 
+.plan-streaming {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 320px;
+}
+
+.plan-streaming__status {
+  font-size: 0.95rem;
+  color: #606266;
+}
+
+.plan-streaming__preview {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 0.75rem;
+  background-color: #f5f7fa;
+  border-radius: 8px;
+}
+
+.plan-raw {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 320px;
+}
+
+.plan-raw__title {
+  font-size: 0.95rem;
+  color: #303133;
+  margin: 0;
+}
+
+.plan-raw__content {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 0.75rem;
+  background-color: #f5f7fa;
+  border-radius: 8px;
+}
+
+.plan-library__table {
+  font-size: 0.85rem;
+}
+
 .card-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-}
-
-.planner__logs {
-  margin-top: 1rem;
-  padding: 0.75rem;
-  background: #f5f7fa;
-  border-radius: 8px;
-  border: 1px solid #ebeef5;
-}
-
-.planner__logs ul {
-  margin: 0;
-  padding-left: 1.25rem;
-  color: #606266;
-  font-size: 0.9rem;
-  line-height: 1.6;
 }
 
 .planner__voice-preview {

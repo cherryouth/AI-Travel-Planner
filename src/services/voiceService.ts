@@ -413,6 +413,9 @@ export async function startVoiceRecognition(
       return;
     }
     shouldCloseAfterFinal = true;
+    if (!hasFirstFrame) {
+      sendQueue.push({ audio: '', status: 0 });
+    }
     sendQueue.push({ audio: '', status: 2 });
     flushQueue();
   };

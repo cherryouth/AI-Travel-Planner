@@ -225,7 +225,8 @@ export const usePlannerStore = defineStore('planner', () => {
   const loading = ref(false);
   const error = ref<string | null>(null);
   const diagnostics = ref<string[]>([]);
-  const parseLogs = ref<string[]>([]);
+  const streamingPreview = ref('');
+  const rawHunyuanContent = ref('');
 
   const voiceSession = ref<VoiceRecognitionSession | null>(null);
   const voiceLiveText = ref('');
@@ -291,9 +292,6 @@ export const usePlannerStore = defineStore('planner', () => {
   function analyzeIntent(text?: string, options: { appendNotes?: boolean } = {}): ParseOutcome {
     const sourceText = text ?? form.intentText;
     const intent = parseIntent(sourceText, form);
-    if (intent.messages.length) {
-      parseLogs.value = [...parseLogs.value, ...intent.messages];
-    }
     applyParsedIntent(intent, { appendNotes: options.appendNotes ?? true });
     if (intent.notes && !text) {
       form.intentText = intent.notes;
@@ -306,7 +304,6 @@ export const usePlannerStore = defineStore('planner', () => {
       await stopVoiceInput();
     }
     voiceError.value = null;
-    parseLogs.value = [];
 
     try {
       const session = await startVoiceRecognition(handleSpeechResult, {
@@ -338,6 +335,20 @@ export const usePlannerStore = defineStore('planner', () => {
     }
   }
 
+  async function completeVoiceInput() {
+    const pending = voiceLiveText.value.trim();
+    if (!pending) {
+      return;
+    }
+
+    await stopVoiceInput();
+    voiceFinalText.value = pending;
+
+    const existing = form.intentText.trim();
+    form.intentText = existing ? `${existing}\n${pending}` : pending;
+    analyzeIntent(pending, { appendNotes: true });
+  }
+
   function handleSpeechResult(result: SpeechResult) {
     voiceLiveText.value = result.text;
     if (result.isFinal) {
@@ -363,9 +374,15 @@ export const usePlannerStore = defineStore('planner', () => {
     };
   }
 
+  function getPreferenceSnapshot(): TravelPreferences {
+    return buildPreferences();
+  }
+
   async function submitPlan() {
     error.value = null;
     diagnostics.value = [];
+    streamingPreview.value = '';
+    rawHunyuanContent.value = '';
 
     if (!form.destination) {
       error.value = '请先填写或识别旅行目的地';
@@ -387,42 +404,67 @@ export const usePlannerStore = defineStore('planner', () => {
     try {
       const preferences = buildPreferences();
       const payloadBudget = form.budget ?? 0;
-      const result = await generatePlan({
-        destination: form.destination,
-        startDate: form.startDate,
-        endDate: form.endDate,
-        budget: payloadBudget,
-        travelers: Math.max(1, Math.round(form.travelers)),
-        preferences,
-      });
+      streamingPreview.value = '正在向混元 T1 请求规划，请稍候...';
+      const result = await generatePlan(
+        {
+          destination: form.destination,
+          startDate: form.startDate,
+          endDate: form.endDate,
+          budget: payloadBudget,
+          travelers: Math.max(1, Math.round(form.travelers)),
+          preferences,
+        },
+        {
+          onProgress: preview => {
+            if (preview && preview.trim()) {
+              streamingPreview.value = preview;
+              rawHunyuanContent.value = preview;
+            }
+          },
+        },
+      );
 
       plan.value = result.plan;
       diagnostics.value = result.diagnostics;
-      if (!result.plan) {
-        error.value = '暂时无法生成行程，请稍后重试。';
+      if (result.plan) {
+        rawHunyuanContent.value = '';
+      } else {
+        const finalRaw = result.rawContent ?? rawHunyuanContent.value;
+        rawHunyuanContent.value = finalRaw;
+        if (finalRaw) {
+          error.value = '未能解析混元 AI 返回的 JSON 行程，已展示原始回复，请手动核对。';
+        } else {
+          error.value = '暂时无法生成行程，请稍后重试。';
+        }
       }
+      streamingPreview.value = '';
     } catch (err) {
       error.value = err instanceof Error ? err.message : String(err);
+      rawHunyuanContent.value = '';
       if (import.meta.env.DEV) {
         console.error('[planner] 生成行程失败', err);
       }
     } finally {
       loading.value = false;
+      streamingPreview.value = '';
     }
   }
 
   function resetPlan() {
     plan.value = null;
     diagnostics.value = [];
+    rawHunyuanContent.value = '';
+    streamingPreview.value = '';
   }
 
   function resetForm() {
     const next = createDefaultForm();
     Object.assign(form, next);
-    parseLogs.value = [];
     voiceLiveText.value = '';
     voiceFinalText.value = '';
     voiceError.value = null;
+    rawHunyuanContent.value = '';
+    streamingPreview.value = '';
   }
 
   async function teardown() {
@@ -435,7 +477,8 @@ export const usePlannerStore = defineStore('planner', () => {
     loading,
     error,
     diagnostics,
-    parseLogs,
+    streamingPreview,
+    rawHunyuanContent,
     tripDays,
     voiceLiveText,
     voiceFinalText,
@@ -443,11 +486,13 @@ export const usePlannerStore = defineStore('planner', () => {
     isListening,
     startVoiceInput,
     stopVoiceInput,
+    completeVoiceInput,
     analyzeIntent,
     submitPlan,
     resetPlan,
     resetForm,
     teardown,
+    getPreferenceSnapshot,
     preferenceTagOptions: PREFERENCE_TAG_OPTIONS,
   };
 });

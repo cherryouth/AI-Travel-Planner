@@ -1,4 +1,4 @@
-import type { DayItem, DayPlan, TravelPreferences, TripPlan } from '../types/plan';
+import type { DayItem, DayItemType, DayPlan, TravelPreferences, TripPlan } from '../types/plan';
 
 interface GeneratePlanPayload {
   destination: string;
@@ -12,6 +12,48 @@ interface GeneratePlanPayload {
 export interface PlanResult {
   plan: TripPlan | null;
   diagnostics: string[];
+  rawContent?: string;
+}
+
+interface HunyuanClientConfig {
+  model: string;
+  endpoint: string;
+  temperature?: number;
+  topP?: number;
+  region?: string;
+}
+
+interface LlmDayItem {
+  id?: string;
+  type?: string;
+  title?: string;
+  startTime?: string;
+  endTime?: string;
+  notes?: string;
+  estimatedCost?: number | string;
+}
+
+interface LlmDayPlan {
+  date?: string;
+  summary?: string;
+  items?: LlmDayItem[];
+  totalEstimatedCost?: number | string;
+}
+
+interface LlmTripPlan {
+  title?: string;
+  destination?: string;
+  startDate?: string;
+  endDate?: string;
+  travelers?: number | string;
+  budget?: number | string;
+  currency?: string;
+  days?: LlmDayPlan[];
+}
+
+interface LlmPlanResponse {
+  plan?: LlmTripPlan;
+  diagnostics?: unknown;
 }
 
 type ThemeKey =
@@ -123,6 +165,14 @@ const THEME_LIBRARY: Record<ThemeKey, ThemeTemplate> = {
   },
 };
 
+const SUPPORTED_DAY_ITEM_TYPES: DayItemType[] = [
+  'transport',
+  'attraction',
+  'meal',
+  'hotel',
+  'free',
+];
+
 function pad(num: number): string {
   return num.toString().padStart(2, '0');
 }
@@ -147,6 +197,242 @@ function pickFromList(list: string[], index: number, fallback: string): string {
     return fallback;
   }
   return list[index % list.length] ?? fallback;
+}
+
+function safeString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function coerceNumber(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value.trim().replace(/[,，]/g, ''));
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function normalizeTime(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const match = trimmed.match(/^([0-9]{1,2})(?::([0-9]{1,2}))?$/);
+  if (!match) {
+    return trimmed;
+  }
+
+  const hours = Math.min(23, Math.max(0, Number(match[1])));
+  const minutes = match[2] ? Math.min(59, Math.max(0, Number(match[2]))) : 0;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+}
+
+function stripModelFormatting(content: string): string {
+  const withoutFences = content
+    .replace(/```(?:json)?/gi, '')
+    .replace(/```/g, '')
+    .replace(/\uFEFF/g, '');
+  const trimmed = withoutFences.trim();
+  if (trimmed.startsWith('Note:')) {
+    return trimmed.replace(/^Note:[^\n]*\n?/, '').trim();
+  }
+  return trimmed;
+}
+
+function extractFirstJsonObject(content: string): string | null {
+  const sanitized = content.trim();
+  if (!sanitized) {
+    return null;
+  }
+
+  let startIndex = -1;
+  let depth = 0;
+  for (let i = 0; i < sanitized.length; i += 1) {
+    const char = sanitized[i];
+    if (char === '{') {
+      if (depth === 0) {
+        startIndex = i;
+      }
+      depth += 1;
+    } else if (char === '}') {
+      if (depth > 0) {
+        depth -= 1;
+        if (depth === 0 && startIndex !== -1) {
+          return sanitized.slice(startIndex, i + 1);
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function tryParseJson<T>(input: string): T | null {
+  try {
+    return JSON.parse(input) as T;
+  } catch {
+    return null;
+  }
+}
+
+function looksLikeTripPlanStructure(value: unknown): value is LlmTripPlan {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.days) && record.days.length > 0) {
+    return true;
+  }
+  const indicativeKeys = ['destination', 'startDate', 'endDate', 'title'];
+  return indicativeKeys.some(key => typeof record[key] === 'string');
+}
+
+function resolvePlanEnvelope(candidate: unknown): LlmPlanResponse | null {
+  if (!candidate || typeof candidate !== 'object') {
+    return null;
+  }
+
+  const visited = new Set<unknown>();
+  const queue: unknown[] = [candidate];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || visited.has(current)) {
+      continue;
+    }
+    visited.add(current);
+
+    const record = current as Record<string, unknown>;
+    const planKey = Object.keys(record).find(key => key.toLowerCase() === 'plan');
+    if (planKey) {
+      const planValue = record[planKey];
+      if (planValue && typeof planValue === 'object') {
+        const diagnosticsKey = Object.keys(record).find(key => key.toLowerCase() === 'diagnostics');
+        const diagnosticsValue =
+          diagnosticsKey !== undefined ? record[diagnosticsKey] : record.diagnostics;
+        return {
+          plan: planValue as LlmTripPlan,
+          diagnostics: diagnosticsValue,
+        };
+      }
+    }
+
+    if (looksLikeTripPlanStructure(record)) {
+      return {
+        plan: record as unknown as LlmTripPlan,
+        diagnostics: (record as { diagnostics?: unknown }).diagnostics,
+      };
+    }
+
+    for (const next of Object.values(record)) {
+      if (next && typeof next === 'object' && !visited.has(next)) {
+        queue.push(next);
+      }
+    }
+  }
+
+  return null;
+}
+
+function parsePlanResponseFromContent(content: string): LlmPlanResponse {
+  const sanitized = stripModelFormatting(content);
+  const attempts: string[] = [];
+  if (sanitized) {
+    attempts.push(sanitized);
+  }
+
+  const block = extractFirstJsonObject(sanitized);
+  if (block && block !== sanitized) {
+    attempts.push(block);
+  }
+
+  for (const candidate of attempts) {
+    const parsed = tryParseJson<unknown>(candidate);
+    if (!parsed) {
+      continue;
+    }
+    const normalized = resolvePlanEnvelope(parsed);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  throw new Error('混元 T1 返回内容未包含可解析的 JSON 计划。');
+}
+
+function readChoiceContent(choice: unknown): string {
+  if (!choice || typeof choice !== 'object') {
+    return '';
+  }
+
+  const record = choice as Record<string, unknown>;
+  const message = record.Message;
+  if (message && typeof message === 'object') {
+    const content = (message as Record<string, unknown>).Content;
+    if (typeof content === 'string' && content.trim()) {
+      return content;
+    }
+  }
+
+  const delta = record.Delta;
+  if (delta && typeof delta === 'object') {
+    const content = (delta as Record<string, unknown>).Content;
+    if (typeof content === 'string' && content.trim()) {
+      return content;
+    }
+  }
+
+  if (typeof record.Content === 'string' && record.Content.trim()) {
+    return record.Content;
+  }
+
+  return '';
+}
+
+function collectChoiceContents(
+  choices: unknown,
+  options?: {
+    preserveWhitespace?: boolean;
+  },
+): string {
+  if (!Array.isArray(choices)) {
+    return '';
+  }
+
+  const segments = choices
+    .map(choice => readChoiceContent(choice))
+    .filter(part => {
+      if (!part) {
+        return false;
+      }
+      if (options?.preserveWhitespace) {
+        return part.length > 0;
+      }
+      return part.trim().length > 0;
+    });
+
+  if (options?.preserveWhitespace) {
+    return segments.join('');
+  }
+
+  return segments.join('\n').trim();
+}
+
+function parseDiagnostics(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .map(item => (typeof item === 'string' ? item.trim() : ''))
+    .filter(entry => entry.length > 0);
 }
 
 function resolveThemeSequence(preferences: TravelPreferences): ThemeKey[] {
@@ -347,17 +633,624 @@ function buildHeuristicPlan(payload: GeneratePlanPayload): PlanResult {
   return { plan, diagnostics };
 }
 
-export async function generatePlan(payload: GeneratePlanPayload): Promise<PlanResult> {
-  try {
-    // 预留：未来在此集成真实的 Hunyuan-T1 API。
-    // 如果配置了有效的 API Key，可在此处调用远程模型。
-    // 当前环境若缺少密钥，则直接使用本地智能生成器。
-    return buildHeuristicPlan(payload);
-  } catch (err) {
-    const diagnostics = ['行程规划引擎异常，已返回空计划。'];
-    if (import.meta.env.DEV) {
-      console.error('[aiPlanner] 生成行程失败', err);
+export async function generatePlan(
+  payload: GeneratePlanPayload,
+  options: {
+    onProgress?: (preview: string) => void;
+  } = {},
+): Promise<PlanResult> {
+  const hunyuanAttempt = await tryHunyuanPlan(payload, options);
+  if (hunyuanAttempt.planResult) {
+    return hunyuanAttempt.planResult;
+  }
+
+  const fallback = buildHeuristicPlan(payload);
+  if (hunyuanAttempt.warning) {
+    fallback.diagnostics.unshift(hunyuanAttempt.warning);
+  }
+  return fallback;
+}
+
+function resolveHunyuanConfig(): HunyuanClientConfig {
+  const model =
+    (import.meta.env.VITE_HUNYUAN_T1_MODEL as string | undefined)?.trim() ?? 'hunyuan-t1-latest';
+  const endpoint =
+    (import.meta.env.VITE_HUNYUAN_T1_ENDPOINT as string | undefined)?.trim() ??
+    (import.meta.env.VITE_HUNYUAN_T1_PROXY_ENDPOINT as string | undefined)?.trim() ??
+    'https://hunyuan.tencentcloudapi.com';
+
+  const defaultTemperature = 0.2;
+  const temperatureRaw = (
+    import.meta.env.VITE_HUNYUAN_T1_TEMPERATURE as string | undefined
+  )?.trim();
+  const temperatureValue =
+    temperatureRaw && temperatureRaw.length > 0 ? Number(temperatureRaw) : defaultTemperature;
+  const temperature = Number.isFinite(temperatureValue) ? temperatureValue : defaultTemperature;
+
+  const topPRaw = (import.meta.env.VITE_HUNYUAN_T1_TOP_P as string | undefined)?.trim();
+  const topPValue = topPRaw ? Number(topPRaw) : Number.NaN;
+  const topP = Number.isFinite(topPValue) && topPValue > 0 ? topPValue : undefined;
+
+  const region = (import.meta.env.VITE_HUNYUAN_T1_REGION as string | undefined)?.trim();
+
+  return {
+    model,
+    endpoint,
+    temperature,
+    topP,
+    region,
+  };
+}
+
+const PLAN_RESPONSE_TEMPLATE =
+  '{"plan":{"title":"示例行程标题","destination":"目的地","startDate":"YYYY-MM-DD","endDate":"YYYY-MM-DD","travelers":2,"budget":8000,"currency":"CNY","days":[{"date":"YYYY-MM-DD","summary":"当天概述","items":[{"type":"transport","title":"描述","startTime":"08:00","endTime":"09:00","notes":"备注","estimatedCost":300}],"totalEstimatedCost":1200}]},"diagnostics":["关键说明或建议"]}';
+
+function createHunyuanSystemPrompt(): string {
+  return [
+    '你是一名专业的中文旅行规划师，负责根据用户需求生成详细的行程安排与预算估计。',
+    '请严格遵守以下规则：',
+    '1. 仅输出标准 JSON 文本，不得包含额外解释、注释或 Markdown 代码块。',
+    '2. 所有金额使用数字表示，默认货币为人民币（CNY）。',
+    '3. 确保返回的字段齐全且与输入要求匹配。',
+  ].join('\n');
+}
+
+function composeHunyuanUserPrompt(payload: GeneratePlanPayload): string {
+  const { destination, startDate, endDate, budget, travelers, preferences } = payload;
+  const tags = [
+    ...(preferences.themes ?? []),
+    preferences.pace ? `节奏：${preferences.pace}` : '',
+    preferences.kidFriendly ? '适合亲子' : '',
+  ].filter(Boolean);
+
+  const rows: string[] = [];
+  rows.push('请根据以下旅行需求生成行程规划，请返回符合字段约束的 JSON：');
+  rows.push(`- 目的地：${destination}`);
+  rows.push(`- 行程日期：${startDate} 至 ${endDate}`);
+  rows.push(`- 预算：${budget > 0 ? `${budget} 元` : '未指定，请合理估算'}`);
+  rows.push(`- 出行人数：${travelers} 人`);
+  rows.push(`- 出行偏好：${tags.length > 0 ? tags.join('，') : '未特别说明'}`);
+  rows.push('- 若缺少具体信息，请结合常见安排给出合理估计。');
+  rows.push('- items.type 字段仅可使用 transport、attraction、meal、hotel、free 之一。');
+  rows.push('- 所有日期采用 YYYY-MM-DD，时间使用 24 小时制，可留空。');
+  rows.push('- diagnostics 为中文数组，可用于说明预算分配或注意事项。');
+  rows.push('\n返回 JSON 示例（请根据实际需求填充内容）：');
+  rows.push(PLAN_RESPONSE_TEMPLATE);
+
+  return rows.join('\n');
+}
+
+function mapLlmPlanToTrip(payload: GeneratePlanPayload, llmPlan: LlmTripPlan): TripPlan | null {
+  const daysSource = Array.isArray(llmPlan.days)
+    ? llmPlan.days.filter(day => day && typeof day === 'object')
+    : [];
+
+  if (daysSource.length === 0) {
+    return null;
+  }
+
+  const destination = safeString(llmPlan.destination) || payload.destination;
+  const startDate = safeString(llmPlan.startDate) || payload.startDate;
+  const startDateObj = new Date(`${startDate}T00:00:00`);
+  const startDateValid = !Number.isNaN(startDateObj.getTime());
+
+  const derivedEndDate = (() => {
+    if (!startDateValid) {
+      return payload.endDate;
     }
-    return { plan: null, diagnostics };
+    const end = new Date(startDateObj);
+    end.setDate(end.getDate() + daysSource.length - 1);
+    return formatDate(end);
+  })();
+
+  const endDate = safeString(llmPlan.endDate) || derivedEndDate;
+  const travelers = Math.max(1, Math.round(coerceNumber(llmPlan.travelers, payload.travelers)));
+  const budgetSource = coerceNumber(llmPlan.budget, payload.budget);
+  const budget = budgetSource > 0 ? budgetSource : payload.budget;
+  const currency = safeString(llmPlan.currency) || 'CNY';
+  const title = safeString(llmPlan.title) || `${destination} ${daysSource.length} 日行程`;
+
+  const days: DayPlan[] = daysSource.map((day, dayIndex) => {
+    const dateSource = safeString(day.date);
+    let isoDate = dateSource;
+    if (!isoDate) {
+      if (startDateValid) {
+        const current = new Date(startDateObj);
+        current.setDate(startDateObj.getDate() + dayIndex);
+        isoDate = formatDate(current);
+      } else {
+        isoDate = payload.startDate;
+      }
+    }
+
+    const itemsSource = Array.isArray(day.items)
+      ? day.items.filter(item => item && typeof item === 'object')
+      : [];
+
+    const items: DayItem[] = itemsSource.map((item, itemIndex) => {
+      const rawType = safeString(item.type).toLowerCase();
+      const type = SUPPORTED_DAY_ITEM_TYPES.includes(rawType as DayItemType)
+        ? (rawType as DayItemType)
+        : 'attraction';
+
+      const estimatedCostSource = coerceNumber(item.estimatedCost, 0);
+      const estimatedCost = estimatedCostSource > 0 ? estimatedCostSource : undefined;
+
+      return {
+        id: safeString(item.id) || createId(type),
+        type,
+        title: safeString(item.title) || `行程事项 ${itemIndex + 1}`,
+        startTime: normalizeTime(item.startTime),
+        endTime: normalizeTime(item.endTime),
+        notes: safeString(item.notes) || undefined,
+        estimatedCost,
+      };
+    });
+
+    const totalEstimatedCostSource =
+      day.totalEstimatedCost !== undefined
+        ? coerceNumber(day.totalEstimatedCost, 0)
+        : items.reduce((sum, entry) => sum + (entry.estimatedCost ?? 0), 0);
+
+    const totalEstimatedCost = totalEstimatedCostSource > 0 ? totalEstimatedCostSource : undefined;
+
+    return {
+      id: createId('day'),
+      date: isoDate,
+      summary: safeString(day.summary) || `第 ${dayIndex + 1} 天行程安排`,
+      items,
+      totalEstimatedCost,
+    };
+  });
+
+  if (days.length === 0) {
+    return null;
+  }
+
+  return {
+    id: createId('plan'),
+    title,
+    destination,
+    startDate,
+    endDate,
+    travelers,
+    budget,
+    currency,
+    days,
+  };
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === 'string') {
+    return error;
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
+interface HunyuanAttemptResult {
+  planResult: PlanResult | null;
+  warning?: string;
+}
+
+interface HunyuanChatErrorInfo {
+  Code?: string;
+  Message?: string;
+}
+
+interface HunyuanChatResponse {
+  Response?: {
+    Choices?: unknown[];
+    Error?: HunyuanChatErrorInfo;
+    Note?: string;
+    RequestId?: string;
+  };
+  Note?: string;
+}
+
+type HunyuanErrorLike = {
+  Code?: string;
+  Message?: string;
+};
+
+function parseSseEventPayload(rawEvent: string): string | null {
+  const trimmed = rawEvent.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const lines = trimmed.replace(/\r\n/g, '\n').split('\n');
+  const dataLines: string[] = [];
+
+  for (const line of lines) {
+    if (!line.startsWith('data:')) {
+      continue;
+    }
+    let payload = line.slice(5);
+    if (payload.startsWith(' ')) {
+      payload = payload.slice(1);
+    }
+    dataLines.push(payload);
+  }
+
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  return dataLines.join('\n');
+}
+
+function extractChoicesFromChunk(chunk: unknown): unknown[] | null {
+  if (!chunk || typeof chunk !== 'object') {
+    return null;
+  }
+
+  const record = chunk as Record<string, unknown>;
+  if (Array.isArray(record.Choices)) {
+    return record.Choices;
+  }
+
+  const response = record.Response;
+  if (response && typeof response === 'object') {
+    const nested = (response as Record<string, unknown>).Choices;
+    if (Array.isArray(nested)) {
+      return nested;
+    }
+  }
+
+  return null;
+}
+
+function extractErrorFromChunk(chunk: unknown): HunyuanErrorLike | null {
+  if (!chunk || typeof chunk !== 'object') {
+    return null;
+  }
+
+  const record = chunk as Record<string, unknown>;
+  const direct = record.ErrorMsg;
+  if (direct && typeof direct === 'object') {
+    return direct as HunyuanErrorLike;
+  }
+
+  const response = record.Response;
+  if (response && typeof response === 'object') {
+    const nestedError = (response as Record<string, unknown>).Error;
+    if (nestedError && typeof nestedError === 'object') {
+      return nestedError as HunyuanErrorLike;
+    }
+  }
+
+  return null;
+}
+
+function extractFinishReasons(choices: unknown[]): string[] {
+  const results: string[] = [];
+  choices.forEach(choice => {
+    if (!choice || typeof choice !== 'object') {
+      return;
+    }
+    const finish = (choice as Record<string, unknown>).FinishReason;
+    if (typeof finish === 'string') {
+      results.push(finish);
+    }
+  });
+  return results;
+}
+
+function formatHunyuanError(errorInfo: HunyuanErrorLike | null | undefined): string {
+  if (!errorInfo) {
+    return '混元 T1 返回错误。';
+  }
+  const message = [errorInfo.Code, errorInfo.Message].filter(Boolean).join(': ');
+  return message || '混元 T1 返回错误。';
+}
+
+async function consumeHunyuanStream(
+  response: Response,
+  onChunk?: (preview: string) => void,
+): Promise<string> {
+  const body = response.body;
+  if (!body) {
+    throw new Error('混元代理未返回可读的流式数据。');
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder('utf-8');
+
+  let buffer = '';
+  let aggregatedContent = '';
+  let stopDetected = false;
+  let readerCancelled = false;
+  let completedNaturally = false;
+
+  const handleEvent = (rawEvent: string) => {
+    const payload = parseSseEventPayload(rawEvent);
+    if (payload === null) {
+      return;
+    }
+
+    if (payload === '[DONE]') {
+      stopDetected = true;
+      return;
+    }
+
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(payload) as unknown;
+    } catch (err) {
+      if (import.meta.env.DEV) {
+        console.warn('[aiPlanner] 无法解析混元流式片段', err, payload);
+      }
+      return;
+    }
+
+    const errorInfo = extractErrorFromChunk(chunk);
+    if (errorInfo) {
+      throw new Error(formatHunyuanError(errorInfo));
+    }
+
+    const choices = extractChoicesFromChunk(chunk);
+    if (choices) {
+      const piece = collectChoiceContents(choices, { preserveWhitespace: true });
+      if (piece) {
+        aggregatedContent += piece;
+        onChunk?.(aggregatedContent);
+      }
+      const finishReasons = extractFinishReasons(choices);
+      if (finishReasons.includes('sensitive')) {
+        throw new Error('混元 T1 返回内容未通过安全审核。');
+      }
+      if (finishReasons.includes('stop')) {
+        stopDetected = true;
+      }
+    }
+  };
+
+  const processBuffer = (force = false) => {
+    buffer = buffer.replace(/\r\n/g, '\n');
+    let boundaryIndex = buffer.indexOf('\n\n');
+
+    while (boundaryIndex >= 0) {
+      const rawEvent = buffer.slice(0, boundaryIndex);
+      buffer = buffer.slice(boundaryIndex + 2);
+      handleEvent(rawEvent);
+      boundaryIndex = buffer.indexOf('\n\n');
+    }
+
+    if (force && buffer.trim().length > 0) {
+      handleEvent(buffer);
+      buffer = '';
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        processBuffer(true);
+        completedNaturally = true;
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      processBuffer();
+
+      if (stopDetected) {
+        processBuffer(true);
+        await reader.cancel().catch(() => undefined);
+        readerCancelled = true;
+        break;
+      }
+    }
+  } catch (err) {
+    if (!readerCancelled) {
+      await reader.cancel().catch(() => undefined);
+      readerCancelled = true;
+    }
+    throw err;
+  } finally {
+    if (!readerCancelled && !completedNaturally) {
+      await reader.cancel().catch(() => undefined);
+    }
+  }
+
+  if (!aggregatedContent.trim()) {
+    throw new Error('混元 T1 流式响应未包含有效内容。');
+  }
+
+  return aggregatedContent;
+}
+
+async function tryHunyuanPlan(
+  payload: GeneratePlanPayload,
+  options: {
+    onProgress?: (preview: string) => void;
+  } = {},
+): Promise<HunyuanAttemptResult> {
+  const config = resolveHunyuanConfig();
+
+  try {
+    const systemPrompt = createHunyuanSystemPrompt();
+    const userPrompt = composeHunyuanUserPrompt(payload);
+
+    const unparseableMessage = '混元 T1 返回内容无法解析为 JSON 行程，已展示原始回复。';
+    const provideRawContent = (raw: string, reason?: unknown): HunyuanAttemptResult => {
+      const original = raw ?? '';
+      const normalized = original.trim();
+      if (!normalized) {
+        throw new Error('混元 T1 返回数据里没有有效的文本内容。');
+      }
+      if (import.meta.env.DEV && reason) {
+        console.warn('[aiPlanner] 混元 T1 返回内容无法解析', reason, raw);
+      }
+      options.onProgress?.(original);
+      return {
+        planResult: {
+          plan: null,
+          diagnostics: [unparseableMessage],
+          rawContent: original,
+        },
+        warning: unparseableMessage,
+      };
+    };
+
+    const requestBody: Record<string, unknown> = {
+      Model: config.model,
+      Messages: [
+        { Role: 'system', Content: systemPrompt },
+        { Role: 'user', Content: userPrompt },
+      ],
+      Stream: true,
+    };
+
+    if (typeof config.temperature === 'number' && Number.isFinite(config.temperature)) {
+      requestBody.Temperature = config.temperature;
+    }
+    if (typeof config.topP === 'number' && Number.isFinite(config.topP)) {
+      requestBody.TopP = config.topP;
+    }
+
+    options.onProgress?.('正在向混元 T1 请求规划，请稍候...');
+
+    const proxyResponse = await fetch('/api/hunyuan/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        endpoint: config.endpoint,
+        region: config.region ?? undefined,
+        action: 'ChatCompletions',
+        version: '2023-09-01',
+        body: requestBody,
+      }),
+    });
+    if (!proxyResponse.ok) {
+      const rawError = await proxyResponse.text();
+      let errorMessage = `HTTP ${proxyResponse.status}`;
+      if (rawError) {
+        try {
+          const parsed = JSON.parse(rawError) as {
+            error?: string;
+            Response?: { Error?: HunyuanChatErrorInfo };
+          };
+          if (typeof parsed.error === 'string' && parsed.error.trim()) {
+            errorMessage = parsed.error.trim();
+          } else if (parsed.Response?.Error) {
+            const { Code, Message } = parsed.Response.Error;
+            errorMessage = [Code, Message].filter(Boolean).join(': ') || errorMessage;
+          }
+        } catch (parseErr) {
+          if (import.meta.env.DEV) {
+            console.warn('[aiPlanner] 混元代理错误响应解析失败', parseErr);
+          }
+        }
+      }
+      throw new Error(errorMessage);
+    }
+
+    const contentType = proxyResponse.headers.get('content-type') ?? '';
+
+    let parsed: LlmPlanResponse | null = null;
+    let rawContentForDisplay = '';
+
+    if (contentType.includes('text/event-stream')) {
+      const aggregatedContent = await consumeHunyuanStream(proxyResponse, preview => {
+        if (preview && preview.trim()) {
+          options.onProgress?.(preview);
+        }
+      });
+      options.onProgress?.('正在整理规划结果，请稍候...');
+      rawContentForDisplay = aggregatedContent;
+      try {
+        parsed = parsePlanResponseFromContent(aggregatedContent);
+      } catch (err) {
+        return provideRawContent(rawContentForDisplay, err);
+      }
+    } else {
+      const rawText = await proxyResponse.text();
+      options.onProgress?.('已收到完整响应，正在解析...');
+      const trimmed = rawText.trim();
+      if (!trimmed) {
+        throw new Error('混元 T1 返回内容为空。');
+      }
+      rawContentForDisplay = trimmed;
+
+      let payloadJson: HunyuanChatResponse;
+      try {
+        payloadJson = JSON.parse(trimmed) as HunyuanChatResponse;
+      } catch (err) {
+        throw new Error(`混元 T1 返回数据不是有效 JSON：${toErrorMessage(err)}`);
+      }
+
+      const responseData = (payloadJson.Response ?? {}) as Record<string, unknown>;
+      const errorInfo = (responseData.Error as HunyuanChatErrorInfo | undefined) ?? undefined;
+      if (errorInfo) {
+        const { Code, Message } = errorInfo;
+        const formatted = [Code, Message].filter(Boolean).join(': ');
+        throw new Error(formatted || '混元 T1 返回错误。');
+      }
+
+      parsed = resolvePlanEnvelope(responseData) ?? resolvePlanEnvelope(payloadJson);
+
+      if (!parsed) {
+        const choicesValue = responseData.Choices as unknown;
+        const contentWithWhitespace = collectChoiceContents(choicesValue, {
+          preserveWhitespace: true,
+        });
+        const content = contentWithWhitespace || collectChoiceContents(choicesValue);
+        if (!content) {
+          if (import.meta.env.DEV) {
+            console.warn('[aiPlanner] 混元 T1 返回缺少 Choices 内容', payloadJson);
+          }
+          throw new Error('混元 T1 返回数据里没有有效的文本内容。');
+        }
+        rawContentForDisplay = contentWithWhitespace || content;
+        try {
+          parsed = parsePlanResponseFromContent(content);
+        } catch (err) {
+          return provideRawContent(rawContentForDisplay, err);
+        }
+      }
+    }
+
+    if (!parsed) {
+      return provideRawContent(rawContentForDisplay, new Error('缺少可用的解析结果'));
+    }
+
+    if (!parsed.plan) {
+      return provideRawContent(rawContentForDisplay, new Error('返回结果缺少 plan 字段'));
+    }
+
+    const mappedPlan = mapLlmPlanToTrip(payload, parsed.plan);
+    if (!mappedPlan) {
+      throw new Error('混元 T1 返回的行程数据不完整。');
+    }
+
+    const diagnostics = parseDiagnostics(parsed.diagnostics);
+    diagnostics.unshift('已使用混元 T1 大模型生成行程规划与预算估算。');
+
+    return {
+      planResult: {
+        plan: mappedPlan,
+        diagnostics,
+      },
+    };
+  } catch (error) {
+    const message = toErrorMessage(error);
+    if (import.meta.env.DEV) {
+      console.error('[aiPlanner] 混元 T1 调用失败', error);
+    }
+    return {
+      planResult: null,
+      warning: `混元 T1 调用失败：${message}`,
+    };
   }
 }
