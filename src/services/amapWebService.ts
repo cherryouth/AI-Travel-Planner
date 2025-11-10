@@ -51,6 +51,19 @@ interface WalkingDirectionResponse {
   };
 }
 
+interface InputTipsResponse {
+  status: '0' | '1';
+  info: string;
+  tips?: Array<{
+    name?: string;
+    district?: string;
+    address?: string;
+    location?: string;
+    adcode?: string;
+    typecode?: string;
+  }>;
+}
+
 interface CoordinateConvertResponse {
   status: '0' | '1';
   info: string;
@@ -93,6 +106,15 @@ export interface RouteResult {
   duration: number;
   taxiCost?: number;
   steps: RouteStepResult[];
+}
+
+export interface LocationSuggestion {
+  name: string;
+  district?: string;
+  address?: string;
+  location?: Coordinates;
+  adcode?: string;
+  typeCode?: string;
 }
 
 const AMAP_WEB_SERVICE_KEY = import.meta.env.VITE_AMAP_WEB_SERVICE_KEY?.trim();
@@ -182,6 +204,78 @@ export async function fetchRoute(
     throw new Error(payload.info || '步行路径规划失败');
   }
   return normalizeRouteResult(payload.route?.paths?.[0]);
+}
+
+export async function fetchLocationSuggestions(
+  keywords: string,
+  options?: {
+    city?: string;
+    location?: Coordinates;
+    typeCode?: string;
+    signal?: AbortSignal;
+  },
+): Promise<LocationSuggestion[]> {
+  if (!AMAP_WEB_SERVICE_KEY) {
+    throw new Error('未配置 VITE_AMAP_WEB_SERVICE_KEY，无法获取地点提示。');
+  }
+
+  const query = keywords.trim();
+  if (!query) {
+    return [];
+  }
+
+  const url = new URL('/v3/assistant/inputtips', AMAP_WEB_SERVICE_BASE_URL);
+  url.searchParams.set('key', AMAP_WEB_SERVICE_KEY);
+  url.searchParams.set('keywords', query);
+  url.searchParams.set('datatype', 'poi');
+
+  if (options?.city) {
+    url.searchParams.set('city', options.city);
+  }
+  if (options?.location) {
+    url.searchParams.set('location', formatCoordinates(options.location));
+  }
+  if (options?.typeCode) {
+    url.searchParams.set('typecode', options.typeCode);
+  }
+
+  const requestInit: RequestInit = {};
+  if (options?.signal) {
+    requestInit.signal = options.signal;
+  }
+
+  const response = await fetch(url.toString(), requestInit);
+  if (!response.ok) {
+    throw new Error(`地点提示请求失败（${response.status}）`);
+  }
+
+  const payload = (await response.json()) as InputTipsResponse;
+  if (payload.status !== '1') {
+    throw new Error(payload.info || '地点提示查询失败');
+  }
+
+  const tips = Array.isArray(payload.tips) ? payload.tips : [];
+  const suggestions: LocationSuggestion[] = [];
+
+  tips.forEach(tip => {
+    if (!tip?.name) {
+      return;
+    }
+    const suggestion: LocationSuggestion = {
+      name: tip.name,
+      district: tip.district,
+      address: tip.address,
+      adcode: tip.adcode,
+      typeCode: tip.typecode,
+    };
+    const coords = parseCoordinates(tip.location);
+    if (coords) {
+      suggestion.location = coords;
+    }
+    suggestions.push(suggestion);
+  });
+
+  return suggestions;
 }
 
 export function parseCoordinates(input: string | null | undefined): Coordinates | null {
@@ -401,11 +495,13 @@ function parsePolyline(polyline: string | undefined): Coordinates[] {
   return coords;
 }
 
-function sanitizeInstruction(input: string | undefined): string | undefined {
-  if (!input) {
+function sanitizeInstruction(input: string | undefined | null): string | undefined {
+  if (typeof input !== 'string') {
     return undefined;
   }
-  return input.replace(/<[^>]*>/g, '').trim();
+
+  const cleaned = input.replace(/<[^>]*>/g, '').trim();
+  return cleaned || undefined;
 }
 
 function safeNumber(value: string | number | undefined | null): number | undefined {

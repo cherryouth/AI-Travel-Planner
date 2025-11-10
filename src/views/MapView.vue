@@ -3,7 +3,12 @@
     <el-page-header content="地图导航" class="map-page__header" />
 
     <el-card shadow="hover" class="map-card">
-      <el-form :model="form" label-width="80px" class="map-form" @submit.prevent>
+      <el-form
+        :model="form"
+        label-width="80px"
+        class="map-form"
+        @submit.prevent="handleSearchRoute"
+      >
         <el-form-item label="导航模式">
           <el-radio-group v-model="navMode" class="map-form__modes">
             <el-radio-button label="driving">驾车</el-radio-button>
@@ -12,23 +17,51 @@
         </el-form-item>
 
         <el-form-item label="起点">
-          <el-input
+          <el-autocomplete
             v-model="form.origin"
             placeholder="输入起点，或使用定位"
             clearable
+            :fetch-suggestions="originSuggestionProvider"
+            :debounce="250"
+            value-key="value"
+            highlight-first-item
             @focus="handleFieldFocus('origin')"
-            @keyup.enter="handleSearchRoute"
-          />
+            @select="handleSuggestionSelect('origin', $event)"
+            @clear="handleLocationClear('origin')"
+          >
+            <template #default="{ item }">
+              <div class="map-suggestion">
+                <span class="map-suggestion__title">{{ item.name }}</span>
+                <span v-if="item.address || item.district" class="map-suggestion__meta">
+                  {{ item.district }}{{ item.address }}
+                </span>
+              </div>
+            </template>
+          </el-autocomplete>
         </el-form-item>
 
         <el-form-item label="终点">
-          <el-input
+          <el-autocomplete
             v-model="form.destination"
             placeholder="输入目的地或地址"
             clearable
+            :fetch-suggestions="destinationSuggestionProvider"
+            :debounce="250"
+            value-key="value"
+            highlight-first-item
             @focus="handleFieldFocus('destination')"
-            @keyup.enter="handleSearchRoute"
-          />
+            @select="handleSuggestionSelect('destination', $event)"
+            @clear="handleLocationClear('destination')"
+          >
+            <template #default="{ item }">
+              <div class="map-suggestion">
+                <span class="map-suggestion__title">{{ item.name }}</span>
+                <span v-if="item.address || item.district" class="map-suggestion__meta">
+                  {{ item.district }}{{ item.address }}
+                </span>
+              </div>
+            </template>
+          </el-autocomplete>
         </el-form-item>
 
         <el-form-item label="操作">
@@ -119,11 +152,13 @@ import { loadAmap } from '../services/amapLoader';
 import {
   convertGpsToGcj,
   detectCoordinateText,
+  fetchLocationSuggestions,
   fetchRoute,
   geocodeAddress,
   locateByIP,
   reverseGeocode,
   type Coordinates,
+  type LocationSuggestion,
   type NavMode,
   type RouteResult,
   type RouteStepResult,
@@ -142,6 +177,10 @@ interface RouteStepDisplay {
   duration?: number;
 }
 
+interface SuggestionOption extends LocationSuggestion {
+  value: string;
+}
+
 const mapContainer = ref<HTMLDivElement | null>(null);
 const mapInstance = ref<AMap.Map | null>(null);
 const locationMarker = ref<AMap.Marker | null>(null);
@@ -150,6 +189,7 @@ const isLoadingMap = ref(true);
 const mapError = ref<string | null>(null);
 const loadingRoute = ref(false);
 const locating = ref(false);
+const suggestionAbort = ref<AbortController | null>(null);
 
 const navMode = ref<NavMode>('driving');
 const activeField = ref<'origin' | 'destination'>('origin');
@@ -176,6 +216,14 @@ const locationCache = reactive({
 
 const mapReady = computed(() => Boolean(mapInstance.value) && !mapError.value);
 
+const originSuggestionProvider = (query: string, cb: (data: SuggestionOption[]) => void) => {
+  void provideSuggestions('origin', query, cb);
+};
+
+const destinationSuggestionProvider = (query: string, cb: (data: SuggestionOption[]) => void) => {
+  void provideSuggestions('destination', query, cb);
+};
+
 watch(navMode, () => {
   clearRoutes();
 });
@@ -194,7 +242,65 @@ onBeforeUnmount(() => {
     mapInstance.value.destroy();
     mapInstance.value = null;
   }
+  if (suggestionAbort.value) {
+    suggestionAbort.value.abort();
+    suggestionAbort.value = null;
+  }
 });
+
+function useSuggestionAbortController(): AbortController {
+  if (suggestionAbort.value) {
+    suggestionAbort.value.abort();
+  }
+  suggestionAbort.value = new AbortController();
+  return suggestionAbort.value;
+}
+
+async function provideSuggestions(
+  field: 'origin' | 'destination',
+  query: string,
+  cb: (data: SuggestionOption[]) => void,
+): Promise<void> {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    if (suggestionAbort.value) {
+      suggestionAbort.value.abort();
+      suggestionAbort.value = null;
+    }
+    cb([]);
+    return;
+  }
+
+  const controller = useSuggestionAbortController();
+  try {
+    const suggestions = await fetchLocationSuggestions(trimmed, {
+      location: locationCache[field].coords ?? undefined,
+      signal: controller.signal,
+    });
+    if (suggestionAbort.value !== controller) {
+      return;
+    }
+    const options = suggestions
+      .map<SuggestionOption>(suggestion => ({
+        ...suggestion,
+        value: suggestion.name,
+      }))
+      .slice(0, 8);
+    cb(options);
+  } catch (error) {
+    if ((error as DOMException)?.name !== 'AbortError') {
+      // eslint-disable-next-line no-console
+      console.warn('[AMap] 获取地点提示失败：', error);
+    }
+    if (suggestionAbort.value === controller) {
+      cb([]);
+    }
+  } finally {
+    if (suggestionAbort.value === controller) {
+      suggestionAbort.value = null;
+    }
+  }
+}
 
 async function initMap() {
   isLoadingMap.value = true;
@@ -245,6 +351,19 @@ function swapLocations() {
     { ...locationCache.destination },
     { ...locationCache.origin },
   ];
+}
+
+function handleSuggestionSelect(field: 'origin' | 'destination', option: SuggestionOption) {
+  const value = option.value;
+  form[field] = value;
+  locationCache[field] = {
+    text: value,
+    coords: option.location ?? null,
+  };
+}
+
+function handleLocationClear(field: 'origin' | 'destination') {
+  locationCache[field] = { text: '', coords: null };
 }
 
 async function handleSearchRoute() {
@@ -614,6 +733,22 @@ function formatModeLabel(mode: NavMode): string {
   flex-wrap: wrap;
   color: var(--el-text-color-secondary);
   font-size: 0.85rem;
+}
+
+.map-suggestion {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  line-height: 1.3;
+}
+
+.map-suggestion__title {
+  font-weight: 600;
+}
+
+.map-suggestion__meta {
+  font-size: 0.8rem;
+  color: var(--el-text-color-secondary);
 }
 
 @media (max-width: 1024px) {
