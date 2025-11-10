@@ -1,7 +1,7 @@
 import type { Ref } from 'vue';
 
 export type Coordinates = [number, number];
-export type NavMode = 'driving' | 'walking';
+export type NavMode = 'driving' | 'walking' | 'transit';
 
 interface GeocodeResponse {
   status: '0' | '1';
@@ -9,6 +9,10 @@ interface GeocodeResponse {
   geocodes?: Array<{
     formatted_address?: string;
     location?: string;
+    city?: string | string[];
+    province?: string | string[];
+    district?: string | string[];
+    adcode?: string;
   }>;
 }
 
@@ -51,6 +55,71 @@ interface WalkingDirectionResponse {
   };
 }
 
+interface TransitDirectionResponse {
+  status: '0' | '1';
+  info: string;
+  route?: {
+    transits?: Array<{
+      distance?: string;
+      duration?: string;
+      cost?: string;
+      walking_distance?: string;
+      nightflag?: string;
+      segments?: Array<{
+        entrance?: { name?: string };
+        exit?: { name?: string };
+        walking?: {
+          distance?: string;
+          duration?: string;
+          steps?: Array<{
+            instruction?: string;
+            distance?: string;
+            duration?: string;
+            polyline?: string;
+            action?: string;
+            assistant_action?: string;
+          }>;
+        };
+        bus?: {
+          buslines?: Array<{
+            name?: string;
+            type?: string;
+            distance?: string;
+            duration?: string;
+            via_num?: string;
+            departure_stop?: { name?: string };
+            arrival_stop?: { name?: string };
+            polyline?: string;
+            via_stops?: Array<{ name?: string }>;
+          }>;
+        };
+        railway?: {
+          name?: string;
+          distance?: string;
+          duration?: string;
+          departure_stop?: { name?: string };
+          arrival_stop?: { name?: string };
+          stations?: Array<{ name?: string }>;
+          spaces?: string;
+        };
+        taxi?: {
+          distance?: string;
+          duration?: string;
+          polyline?: string;
+          name?: string;
+          price?: string;
+        };
+      }>;
+    }>;
+  };
+}
+
+type TransitPlan = NonNullable<NonNullable<TransitDirectionResponse['route']>['transits']>[number];
+type TransitSegment = NonNullable<NonNullable<TransitPlan['segments']>[number]>;
+type TransitWalkingStep = NonNullable<
+  NonNullable<NonNullable<TransitSegment['walking']>['steps']>[number]
+>;
+
 interface InputTipsResponse {
   status: '0' | '1';
   info: string;
@@ -76,9 +145,9 @@ interface ReverseGeocodeResponse {
   regeocode?: {
     formatted_address?: string;
     addressComponent?: {
-      city?: string;
-      province?: string;
-      district?: string;
+      city?: string | string[];
+      province?: string | string[];
+      district?: string | string[];
     };
   };
 }
@@ -92,6 +161,12 @@ interface IpLocationResponse {
   rectangle?: string;
 }
 
+export interface RouteCost {
+  amount: number;
+  type: 'taxi' | 'transit' | 'other';
+  label: string;
+}
+
 export interface RouteStepResult {
   instruction: string;
   distance?: number;
@@ -99,13 +174,14 @@ export interface RouteStepResult {
   polyline: Coordinates[];
   action?: string;
   assistantAction?: string;
+  mode?: 'drive' | 'walk' | 'bus' | 'railway' | 'taxi' | 'transfer';
 }
 
 export interface RouteResult {
   distance: number;
   duration: number;
-  taxiCost?: number;
   steps: RouteStepResult[];
+  cost?: RouteCost;
 }
 
 export interface LocationSuggestion {
@@ -129,6 +205,10 @@ const AMAP_WEB_SERVICE_BASE_URL = 'https://restapi.amap.com';
 export async function geocodeAddress(address: string): Promise<{
   location: Coordinates;
   formattedAddress?: string;
+  city?: string;
+  province?: string;
+  district?: string;
+  adcode?: string;
 } | null> {
   if (!AMAP_WEB_SERVICE_KEY) {
     throw new Error('未配置 VITE_AMAP_WEB_SERVICE_KEY，无法执行地址解析。');
@@ -161,6 +241,10 @@ export async function geocodeAddress(address: string): Promise<{
   return {
     location: coords,
     formattedAddress: geocode.formatted_address,
+    city: normalizeAdministrativeValue(geocode.city),
+    province: normalizeAdministrativeValue(geocode.province),
+    district: normalizeAdministrativeValue(geocode.district),
+    adcode: geocode.adcode,
   };
 }
 
@@ -168,9 +252,43 @@ export async function fetchRoute(
   mode: NavMode,
   origin: Coordinates,
   destination: Coordinates,
+  options?: {
+    city?: string;
+    destinationCity?: string;
+  },
 ): Promise<RouteResult> {
   if (!AMAP_WEB_SERVICE_KEY) {
     throw new Error('未配置 VITE_AMAP_WEB_SERVICE_KEY，无法调用路径规划。');
+  }
+
+  if (mode === 'transit') {
+    const url = new URL('/v3/direction/transit/integrated', AMAP_WEB_SERVICE_BASE_URL);
+    url.searchParams.set('key', AMAP_WEB_SERVICE_KEY);
+    url.searchParams.set('origin', formatCoordinates(origin));
+    url.searchParams.set('destination', formatCoordinates(destination));
+    url.searchParams.set('extensions', 'all');
+    if (options?.city) {
+      url.searchParams.set('city', options.city);
+    }
+    if (options?.destinationCity) {
+      url.searchParams.set('cityd', options.destinationCity);
+    }
+
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      throw new Error(`路径规划请求失败（${response.status}）`);
+    }
+
+    const payload = (await response.json()) as TransitDirectionResponse;
+    if (payload.status !== '1') {
+      throw new Error(payload.info || '公共交通路径规划失败');
+    }
+
+    const transitPlan = payload.route?.transits?.[0];
+    if (!transitPlan) {
+      throw new Error('未获取到有效的公共交通方案');
+    }
+    return normalizeTransitResult(transitPlan);
   }
 
   const url = new URL(
@@ -196,14 +314,14 @@ export async function fetchRoute(
     if (payload.status !== '1') {
       throw new Error(payload.info || '驾车路径规划失败');
     }
-    return normalizeRouteResult(payload.route?.paths?.[0], payload.route?.taxi_cost);
+    return normalizeRouteResult(payload.route?.paths?.[0], payload.route?.taxi_cost, mode);
   }
 
   const payload = (await response.json()) as WalkingDirectionResponse;
   if (payload.status !== '1') {
     throw new Error(payload.info || '步行路径规划失败');
   }
-  return normalizeRouteResult(payload.route?.paths?.[0]);
+  return normalizeRouteResult(payload.route?.paths?.[0], undefined, mode);
 }
 
 export async function fetchLocationSuggestions(
@@ -377,9 +495,9 @@ export async function reverseGeocode(location: Coordinates): Promise<{
 
   return {
     formattedAddress: regeocode.formatted_address,
-    city: regeocode.addressComponent?.city,
-    province: regeocode.addressComponent?.province,
-    district: regeocode.addressComponent?.district,
+    city: normalizeAdministrativeValue(regeocode.addressComponent?.city),
+    province: normalizeAdministrativeValue(regeocode.addressComponent?.province),
+    district: normalizeAdministrativeValue(regeocode.addressComponent?.district),
   };
 }
 
@@ -443,17 +561,19 @@ function normalizeRouteResult(
           : never
         : never)
     | undefined,
-  taxiCost?: string,
+  taxiCost: string | undefined,
+  mode: NavMode,
 ): RouteResult {
   if (!path) {
     throw new Error('未获取到有效的路径方案');
   }
 
-  const distance = Number(path.distance ?? 0);
-  const duration = Number(path.duration ?? 0);
+  const distance = safeNumber(path.distance);
+  const duration = safeNumber(path.duration);
   const normalizedSteps: RouteStepResult[] = [];
 
   const steps = Array.isArray(path.steps) ? path.steps : [];
+  const stepMode: RouteStepResult['mode'] = mode === 'walking' ? 'walk' : 'drive';
   steps.forEach(step => {
     if (!step) {
       return;
@@ -463,36 +583,282 @@ function normalizeRouteResult(
       return;
     }
     normalizedSteps.push({
-      instruction: sanitizeInstruction(step.instruction) ?? '行驶/步行继续',
+      instruction:
+        sanitizeInstruction(step.instruction) ??
+        (mode === 'walking' ? '步行继续前进' : '继续向前行驶'),
       distance: safeNumber(step.distance),
       duration: safeNumber(step.duration),
       polyline: coords,
       action: sanitizeInstruction(step.action),
       assistantAction: sanitizeInstruction(step.assistant_action),
+      mode: stepMode,
     });
   });
 
+  const costAmount = safeNumber(taxiCost);
+
   return {
-    distance: Number.isFinite(distance) && distance > 0 ? distance : 0,
-    duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
-    taxiCost: safeNumber(taxiCost),
+    distance: normalizeMetric(distance),
+    duration: normalizeMetric(duration),
     steps: normalizedSteps,
+    cost:
+      typeof costAmount === 'number'
+        ? {
+            amount: costAmount,
+            type: 'taxi',
+            label: '打车费估算',
+          }
+        : undefined,
   };
 }
 
-function parsePolyline(polyline: string | undefined): Coordinates[] {
+function normalizeTransitResult(transit: TransitPlan): RouteResult {
+  const steps: RouteStepResult[] = [];
+  const segments = Array.isArray(transit.segments) ? transit.segments : [];
+
+  segments.forEach(segment => {
+    if (!segment) {
+      return;
+    }
+
+    if (segment.entrance?.name) {
+      steps.push({
+        instruction: `[换乘] 进入 ${sanitizeInstruction(segment.entrance.name) ?? segment.entrance.name}`,
+        polyline: [],
+        mode: 'transfer',
+      });
+    }
+
+    appendWalkingStep(segment, steps);
+    appendBusSteps(segment, steps);
+    appendRailwayStep(segment, steps);
+    appendTaxiStep(segment, steps);
+
+    if (segment.exit?.name) {
+      steps.push({
+        instruction: `[换乘] 离开 ${sanitizeInstruction(segment.exit.name) ?? segment.exit.name}`,
+        polyline: [],
+        mode: 'transfer',
+      });
+    }
+  });
+
+  if (!steps.length) {
+    steps.push({
+      instruction: '请参考地图指引完成出行',
+      polyline: [],
+    });
+  }
+
+  const distance = safeNumber(transit.distance);
+  const duration = safeNumber(transit.duration);
+  const costAmount = safeNumber(transit.cost);
+
+  return {
+    distance: normalizeMetric(distance),
+    duration: normalizeMetric(duration),
+    steps,
+    cost:
+      typeof costAmount === 'number'
+        ? {
+            amount: costAmount,
+            type: 'transit',
+            label: '预计票价',
+          }
+        : undefined,
+  };
+}
+
+function appendWalkingStep(segment: TransitSegment, steps: RouteStepResult[]) {
+  const walking = segment.walking;
+  if (!walking) {
+    return;
+  }
+
+  const walkingSteps = Array.isArray(walking.steps) ? (walking.steps as TransitWalkingStep[]) : [];
+  const polyline: Coordinates[] = [];
+  const instructions: string[] = [];
+
+  walkingSteps.forEach((step: TransitWalkingStep) => {
+    if (!step) {
+      return;
+    }
+    const sanitized = sanitizeInstruction(step.instruction);
+    if (sanitized) {
+      instructions.push(sanitized);
+    }
+    const coords = parsePolyline(step.polyline);
+    if (coords.length) {
+      polyline.push(...coords);
+    }
+  });
+
+  const distance = safeNumber(walking.distance);
+  const duration = safeNumber(walking.duration);
+  let instruction = '[步行] 前往下一换乘点';
+  if (instructions.length) {
+    instruction = `[步行] ${instructions.join('，')}`;
+  } else if (distance) {
+    instruction = `[步行] 前往下一换乘点（约 ${Math.round(distance)} 米）`;
+  }
+
+  steps.push({
+    instruction,
+    distance,
+    duration,
+    polyline,
+    mode: 'walk',
+  });
+}
+
+function appendBusSteps(segment: TransitSegment, steps: RouteStepResult[]) {
+  const buslines = segment.bus?.buslines;
+  if (!Array.isArray(buslines) || !buslines.length) {
+    return;
+  }
+
+  buslines.forEach(line => {
+    if (!line) {
+      return;
+    }
+    const name = sanitizeInstruction(line.name) ?? '公交线路';
+    const departure = sanitizeInstruction(line.departure_stop?.name);
+    const arrival = sanitizeInstruction(line.arrival_stop?.name);
+    const viaStops = safeNumber(line.via_num);
+    const viaText = typeof viaStops === 'number' && viaStops > 0 ? `，途经 ${viaStops} 站` : '';
+
+    const instruction = `[公交] 乘坐${name}${
+      departure ? `，从 ${departure} 上车` : ''
+    }${arrival ? `，前往 ${arrival}` : ''}${viaText}`;
+
+    const polyline = parsePolyline(line.polyline);
+
+    steps.push({
+      instruction,
+      distance: safeNumber(line.distance),
+      duration: safeNumber(line.duration),
+      polyline,
+      mode: 'bus',
+    });
+  });
+}
+
+function appendRailwayStep(segment: TransitSegment, steps: RouteStepResult[]) {
+  const railway = segment.railway;
+  if (!railway) {
+    return;
+  }
+
+  const parts: string[] = [];
+  parts.push(`[轨道] 乘坐${sanitizeInstruction(railway.name) ?? '轨道交通'}`);
+  const departure = sanitizeInstruction(railway.departure_stop?.name);
+  if (departure) {
+    parts.push(`从 ${departure} 上车`);
+  }
+  const arrival = sanitizeInstruction(railway.arrival_stop?.name);
+  if (arrival) {
+    parts.push(`前往 ${arrival}`);
+  }
+  const stationCount = Array.isArray(railway.stations) ? railway.stations.length : 0;
+  if (stationCount > 0) {
+    parts.push(`共 ${stationCount} 站`);
+  }
+
+  const polyline = parsePolyline(railway.spaces);
+
+  steps.push({
+    instruction: parts.join('，'),
+    distance: safeNumber(railway.distance),
+    duration: safeNumber(railway.duration),
+    polyline,
+    mode: 'railway',
+  });
+}
+
+function appendTaxiStep(segment: TransitSegment, steps: RouteStepResult[]) {
+  const taxi = segment.taxi;
+  if (!taxi) {
+    return;
+  }
+
+  const name = sanitizeInstruction(taxi.name) ?? '出租车';
+  const instruction = `[出租车] 乘坐${name}完成当前路段`;
+
+  steps.push({
+    instruction,
+    distance: safeNumber(taxi.distance),
+    duration: safeNumber(taxi.duration),
+    polyline: parsePolyline(taxi.polyline),
+    mode: 'taxi',
+  });
+}
+
+function normalizeMetric(value: number | undefined): number {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  return 0;
+}
+
+function normalizeAdministrativeValue(
+  value: string | string[] | null | undefined,
+): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === 'string') {
+        const normalized = normalizeAdministrativeString(item);
+        if (normalized) {
+          return normalized;
+        }
+      }
+    }
+    return undefined;
+  }
+  return normalizeAdministrativeString(value);
+}
+
+function normalizeAdministrativeString(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '[]') {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function parsePolyline(polyline: string | string[] | undefined | null): Coordinates[] {
   if (!polyline) {
     return [];
   }
+  if (Array.isArray(polyline)) {
+    const coords: Coordinates[] = [];
+    polyline.forEach(point => {
+      const parsed = parseCoordinatePoint(point);
+      if (parsed) {
+        coords.push(parsed);
+      }
+    });
+    return coords;
+  }
+
   const points = polyline.split(';');
   const coords: Coordinates[] = [];
   points.forEach(point => {
-    const coord = parseCoordinates(point);
+    const coord = parseCoordinatePoint(point);
     if (coord) {
       coords.push(coord);
     }
   });
   return coords;
+}
+
+function parseCoordinatePoint(point: string | undefined | null): Coordinates | null {
+  if (!point) {
+    return null;
+  }
+  return parseCoordinates(point);
 }
 
 function sanitizeInstruction(input: string | undefined | null): string | undefined {

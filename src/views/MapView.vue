@@ -13,6 +13,7 @@
           <el-radio-group v-model="navMode" class="map-form__modes">
             <el-radio-button label="driving">驾车</el-radio-button>
             <el-radio-button label="walking">步行</el-radio-button>
+            <el-radio-button label="transit">公共交通</el-radio-button>
           </el-radio-group>
         </el-form-item>
 
@@ -98,8 +99,8 @@
         <el-tag type="success" effect="dark">{{ formatModeLabel(routeSummary.mode) }}</el-tag>
         <span>距离：{{ formatDistance(routeSummary.distance) }}</span>
         <span>耗时：{{ formatDuration(routeSummary.duration) }}</span>
-        <span v-if="routeSummary.taxiCost && routeSummary.taxiCost > 0">
-          打车费估算：¥{{ routeSummary.taxiCost.toFixed(0) }}
+        <span v-if="routeSummary.cost">
+          {{ routeSummary.cost.label }}：¥{{ formatCost(routeSummary.cost.amount) }}
         </span>
       </div>
 
@@ -160,6 +161,7 @@ import {
   type Coordinates,
   type LocationSuggestion,
   type NavMode,
+  type RouteCost,
   type RouteResult,
   type RouteStepResult,
 } from '../services/amapWebService';
@@ -167,18 +169,33 @@ import {
 interface RouteSummary {
   distance: number;
   duration: number;
-  taxiCost?: number;
   mode: NavMode;
+  cost?: RouteCost;
 }
 
 interface RouteStepDisplay {
   instruction: string;
   distance?: number;
   duration?: number;
+  mode?: RouteStepResult['mode'];
 }
 
 interface SuggestionOption extends LocationSuggestion {
   value: string;
+}
+
+interface CachedLocation {
+  text: string;
+  coords: Coordinates | null;
+  city: string | null;
+  province: string | null;
+  district: string | null;
+  adcode: string | null;
+}
+
+interface ResolvedLocation {
+  coords: Coordinates;
+  city: string | null;
 }
 
 const mapContainer = ref<HTMLDivElement | null>(null);
@@ -203,15 +220,20 @@ const routeSummary = ref<RouteSummary | null>(null);
 const routeSteps = ref<RouteStepDisplay[]>([]);
 const routePolyline = ref<AMap.Polyline | null>(null);
 
+function createEmptyLocation(): CachedLocation {
+  return {
+    text: '',
+    coords: null,
+    city: null,
+    province: null,
+    district: null,
+    adcode: null,
+  };
+}
+
 const locationCache = reactive({
-  origin: {
-    text: '',
-    coords: null as Coordinates | null,
-  },
-  destination: {
-    text: '',
-    coords: null as Coordinates | null,
-  },
+  origin: createEmptyLocation(),
+  destination: createEmptyLocation(),
 });
 
 const mapReady = computed(() => Boolean(mapInstance.value) && !mapError.value);
@@ -275,6 +297,7 @@ async function provideSuggestions(
   try {
     const suggestions = await fetchLocationSuggestions(trimmed, {
       location: locationCache[field].coords ?? undefined,
+      city: locationCache[field].city ?? locationCache[field].district ?? undefined,
       signal: controller.signal,
     });
     if (suggestionAbort.value !== controller) {
@@ -347,23 +370,27 @@ function handleFieldFocus(field: 'origin' | 'destination') {
 
 function swapLocations() {
   [form.origin, form.destination] = [form.destination, form.origin];
-  [locationCache.origin, locationCache.destination] = [
-    { ...locationCache.destination },
-    { ...locationCache.origin },
-  ];
+  const originSnapshot = { ...locationCache.origin };
+  const destinationSnapshot = { ...locationCache.destination };
+  Object.assign(locationCache.origin, destinationSnapshot);
+  Object.assign(locationCache.destination, originSnapshot);
 }
 
 function handleSuggestionSelect(field: 'origin' | 'destination', option: SuggestionOption) {
   const value = option.value;
   form[field] = value;
-  locationCache[field] = {
+  Object.assign(locationCache[field], {
     text: value,
     coords: option.location ?? null,
-  };
+    city: null,
+    province: null,
+    district: option.district ?? null,
+    adcode: option.adcode ?? null,
+  });
 }
 
 function handleLocationClear(field: 'origin' | 'destination') {
-  locationCache[field] = { text: '', coords: null };
+  Object.assign(locationCache[field], createEmptyLocation());
 }
 
 async function handleSearchRoute() {
@@ -378,12 +405,28 @@ async function handleSearchRoute() {
 
   loadingRoute.value = true;
   try {
-    const [originCoords, destinationCoords] = await Promise.all([
+    const [originLocation, destinationLocation] = await Promise.all([
       resolveCoordinates('origin'),
       resolveCoordinates('destination'),
     ]);
 
-    const route = await fetchRoute(navMode.value, originCoords, destinationCoords);
+    let routeOptions: Parameters<typeof fetchRoute>[3];
+    if (navMode.value === 'transit') {
+      const originCity = originLocation.city ?? (await ensureCity('origin', originLocation.coords));
+      const destinationCity =
+        destinationLocation.city ?? (await ensureCity('destination', destinationLocation.coords));
+      routeOptions = {
+        city: originCity ?? destinationCity ?? undefined,
+        destinationCity: destinationCity ?? originCity ?? undefined,
+      };
+    }
+
+    const route = await fetchRoute(
+      navMode.value,
+      originLocation.coords,
+      destinationLocation.coords,
+      routeOptions,
+    );
     updateRouteDisplay(navMode.value, route);
     await renderRoutePolyline(route.steps);
   } catch (error) {
@@ -407,6 +450,7 @@ async function locateCurrentPosition() {
   locating.value = true;
   try {
     let targetCoords: Coordinates | null = null;
+    let ipFallback: Awaited<ReturnType<typeof locateByIP>> | null = null;
 
     if (typeof navigator !== 'undefined' && navigator.geolocation) {
       try {
@@ -435,6 +479,7 @@ async function locateCurrentPosition() {
       const ipLocation = await locateByIP().catch(() => null);
       if (ipLocation?.location) {
         targetCoords = ipLocation.location;
+        ipFallback = ipLocation;
       }
     }
 
@@ -450,12 +495,35 @@ async function locateCurrentPosition() {
     const regeo = await reverseGeocode(targetCoords).catch(() => null);
     const address =
       regeo?.formattedAddress ?? `${targetCoords[0].toFixed(6)},${targetCoords[1].toFixed(6)}`;
+    const cityName =
+      deriveCityName(regeo?.city ?? null, regeo?.province ?? null, regeo?.district ?? null) ??
+      sanitizeAdministrativeName(ipFallback?.city ?? null);
+    const provinceName = sanitizeAdministrativeName(
+      regeo?.province ?? ipFallback?.province ?? null,
+    );
+    const districtName = sanitizeAdministrativeName(regeo?.district ?? null);
+    const adcodeValue = ipFallback?.adcode ?? null;
+
     if (activeField.value === 'origin') {
       form.origin = address;
-      locationCache.origin = { text: address, coords: targetCoords };
+      Object.assign(locationCache.origin, {
+        text: address,
+        coords: targetCoords,
+        city: cityName,
+        province: provinceName,
+        district: districtName,
+        adcode: adcodeValue,
+      });
     } else {
       form.destination = address;
-      locationCache.destination = { text: address, coords: targetCoords };
+      Object.assign(locationCache.destination, {
+        text: address,
+        coords: targetCoords,
+        city: cityName,
+        province: provinceName,
+        district: districtName,
+        adcode: adcodeValue,
+      });
     }
 
     await updateLocationMarker(targetCoords);
@@ -467,7 +535,7 @@ async function locateCurrentPosition() {
   }
 }
 
-async function resolveCoordinates(field: 'origin' | 'destination'): Promise<Coordinates> {
+async function resolveCoordinates(field: 'origin' | 'destination'): Promise<ResolvedLocation> {
   const input = form[field].trim();
   if (!input) {
     throw new Error(field === 'origin' ? '请填写起点信息' : '请填写终点信息');
@@ -475,13 +543,22 @@ async function resolveCoordinates(field: 'origin' | 'destination'): Promise<Coor
 
   const direct = detectCoordinateText(input);
   if (direct) {
-    locationCache[field] = { text: input, coords: direct };
-    return direct;
+    Object.assign(locationCache[field], {
+      text: input,
+      coords: direct,
+    });
+    return {
+      coords: direct,
+      city: locationCache[field].city,
+    };
   }
 
   const cached = locationCache[field];
   if (cached.coords && cached.text === input) {
-    return cached.coords;
+    return {
+      coords: cached.coords,
+      city: cached.city,
+    };
   }
 
   const geocode = await geocodeAddress(input);
@@ -489,8 +566,53 @@ async function resolveCoordinates(field: 'origin' | 'destination'): Promise<Coor
     throw new Error('未能解析该地址，请尝试输入更精确的位置');
   }
 
-  locationCache[field] = { text: input, coords: geocode.location };
-  return geocode.location;
+  const cityName = deriveCityName(
+    geocode.city ?? null,
+    geocode.province ?? null,
+    geocode.district ?? null,
+  );
+
+  Object.assign(locationCache[field], {
+    text: input,
+    coords: geocode.location,
+    city: cityName,
+    province: geocode.province ?? null,
+    district: geocode.district ?? null,
+    adcode: geocode.adcode ?? null,
+  });
+
+  return {
+    coords: geocode.location,
+    city: cityName,
+  };
+}
+
+async function ensureCity(
+  field: 'origin' | 'destination',
+  coords: Coordinates,
+): Promise<string | null> {
+  const cached = locationCache[field];
+  if (cached.city) {
+    return cached.city;
+  }
+  const regeo = await reverseGeocode(coords).catch(() => null);
+  if (regeo) {
+    const cityName = deriveCityName(
+      regeo.city ?? null,
+      regeo.province ?? null,
+      regeo.district ?? null,
+    );
+    if (cityName) {
+      cached.city = cityName;
+    }
+    if (regeo.province) {
+      cached.province = regeo.province;
+    }
+    if (regeo.district) {
+      cached.district = regeo.district;
+    }
+  }
+  return cached.city;
 }
 
 function updateRouteDisplay(mode: NavMode, route: RouteResult) {
@@ -498,13 +620,14 @@ function updateRouteDisplay(mode: NavMode, route: RouteResult) {
     mode,
     distance: route.distance,
     duration: route.duration,
-    taxiCost: mode === 'driving' && route.taxiCost ? route.taxiCost : undefined,
+    cost: route.cost,
   };
 
   routeSteps.value = route.steps.map((step, index) => ({
     instruction: step.instruction || `第 ${index + 1} 段`,
     distance: step.distance,
     duration: step.duration,
+    mode: step.mode,
   }));
 }
 
@@ -564,6 +687,19 @@ async function updateLocationMarker(coords: Coordinates): Promise<void> {
   map.setZoomAndCenter(14, coords);
 }
 
+function formatCost(amount: number): string {
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return '—';
+  }
+  if (Number.isInteger(amount)) {
+    return amount.toFixed(0);
+  }
+  if (amount < 10) {
+    return amount.toFixed(1);
+  }
+  return amount.toFixed(0);
+}
+
 function formatDistance(distance: number): string {
   if (!Number.isFinite(distance) || distance <= 0) {
     return '—';
@@ -591,7 +727,44 @@ function formatDuration(seconds: number): string {
 }
 
 function formatModeLabel(mode: NavMode): string {
-  return mode === 'driving' ? '驾车导航' : '步行导航';
+  if (mode === 'driving') {
+    return '驾车导航';
+  }
+  if (mode === 'walking') {
+    return '步行导航';
+  }
+  return '公共交通';
+}
+
+function sanitizeAdministrativeName(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '[]') {
+    return null;
+  }
+  return trimmed;
+}
+
+function deriveCityName(
+  city: string | null | undefined,
+  province: string | null | undefined,
+  district: string | null | undefined,
+): string | null {
+  const normalizedCity = sanitizeAdministrativeName(city);
+  if (normalizedCity) {
+    return normalizedCity;
+  }
+  const normalizedProvince = sanitizeAdministrativeName(province);
+  if (normalizedProvince && /市$/.test(normalizedProvince)) {
+    return normalizedProvince;
+  }
+  const normalizedDistrict = sanitizeAdministrativeName(district);
+  if (normalizedDistrict) {
+    return normalizedDistrict;
+  }
+  return normalizedProvince;
 }
 </script>
 
