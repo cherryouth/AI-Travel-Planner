@@ -47,12 +47,21 @@ FROM nginx:1.27-alpine AS runtime
 
 WORKDIR /usr/share/nginx/html
 
+RUN apk add --no-cache nodejs
+
 # Copy compiled assets from the builder stage
 COPY --from=builder /app/dist ./
 
-# Provide a default nginx config that supports SPA history routing
+# Copy proxy server code and runtime scripts
+COPY --from=builder /app/server /server
+COPY --from=builder /app/node_modules/dotenv /server/node_modules/dotenv
+COPY ./scripts/runDocker.mjs /scripts/runDocker.mjs
+
+# Provide a default nginx config that supports SPA history routing and API proxying
 COPY ./server/docker/nginx.conf /etc/nginx/conf.d/default.conf
+
+ENV HUNYUAN_PROXY_PORT=8787
 
 EXPOSE 80
 
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["node", "/scripts/runDocker.mjs"]
