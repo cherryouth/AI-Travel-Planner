@@ -4,13 +4,7 @@
 
     <section class="hero">
       <h1>规划旅行，从一段对话开始</h1>
-      <p>
-        通过语音或文字告知旅行梦想，AI 将即时生成个性化行程，涵盖交通、住宿、景点与预算。
-      </p>
-      <div class="hero__actions">
-        <el-button type="primary" size="large">新建旅行计划</el-button>
-        <el-button size="large" plain>导入已有行程</el-button>
-      </div>
+      <p>通过语音或文字告知旅行梦想，AI 将即时生成个性化行程，涵盖交通、住宿、景点与预算。</p>
     </section>
 
     <el-row :gutter="24" class="feature-grid">
@@ -73,12 +67,6 @@ import { Position, Promotion, TrendCharts } from '@element-plus/icons-vue';
   font-size: 1rem;
   color: #606266;
   line-height: 1.6;
-}
-
-.hero__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1rem;
 }
 
 .feature-grid {

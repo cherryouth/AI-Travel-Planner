@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/runDev.mjs",
+    "dev:vite": "vite",
     "dev:api": "node server/hunyuanProxy.mjs",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
